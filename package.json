@@ -1,12 +1,9 @@
 {
   "name": "@agents-comm-bus/pi-core",
   "version": "0.1.0",
-  "description": "Bundled core for agents-comm-bus Pi per-comm packages (comm-generic tools + lifecycle).",
+  "description": "Bundled core for agents-comm-bus Pi per-comm packages (comm-generic tools + lifecycle). Bundles agents-comm-bus dist/ so the whole chain resolves from git without npm.",
   "type": "module",
   "private": false,
-  "dependencies": {
-    "agents-comm-bus": "*"
-  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",
