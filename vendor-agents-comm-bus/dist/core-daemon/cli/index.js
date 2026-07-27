@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { accountAdd } from "./account-add.js";
+import { accountLookup, formatAccountLookup } from "./account-lookup.js";
 import { accountList } from "./account-list.js";
 import { accountRelabel, } from "./account-relabel.js";
 import { accountRemove } from "./account-remove.js";
@@ -10,6 +11,7 @@ import { allowlistList } from "./allowlist-list.js";
 import { allowlistRemove } from "./allowlist-remove.js";
 import { parseMigrateArgs, runMigration } from "./migrate.js";
 import { reloadDaemonRegistrations } from "./reload-helper.js";
+import { redact } from "./redact.js";
 import { daemonStatus, formatDaemonStatus } from "./status.js";
 async function main() {
     const [command, ...rest] = process.argv.slice(2);
@@ -22,6 +24,8 @@ async function main() {
                 accountLabel: required(args.accountLabel ?? args["account-label"], "--account-label"),
                 comm: args.comm,
                 botToken: args.botToken ?? args["bot-token"],
+                credentialsFile: args.credentialsFile ?? args["credentials-file"],
+                credentialsJson: args.credentialsJson ?? args["credentials-json"],
                 accountId: args.accountId ?? args["account-id"],
             });
             const reload = await reloadDaemonRegistrations();
@@ -35,6 +39,21 @@ async function main() {
                 comm: args.comm,
             });
             console.log(JSON.stringify(rows.map(redact), null, 2));
+            return;
+        }
+        case "account-lookup": {
+            const result = await accountLookup({
+                comm: args.comm,
+                botToken: args.botToken ?? args["bot-token"],
+                accountId: args.accountId ?? args["account-id"],
+                stateRoot: args.stateRoot ?? args["state-root"],
+            });
+            if (args.json !== undefined || args["json"] !== undefined) {
+                console.log(JSON.stringify(result, null, 2));
+            }
+            else {
+                console.log(formatAccountLookup(result));
+            }
             return;
         }
         case "account-remove": {
@@ -69,7 +88,9 @@ async function main() {
                 accountLabel: args.accountLabel ?? args["account-label"],
                 agent: args.agent,
                 project: args.project,
-                botToken: required(args.botToken ?? args["bot-token"], "--bot-token"),
+                botToken: args.botToken ?? args["bot-token"],
+                credentialsFile: args.credentialsFile ?? args["credentials-file"],
+                credentialsJson: args.credentialsJson ?? args["credentials-json"],
                 accountId: args.accountId ?? args["account-id"],
                 allowBotChange: args.allowBotChange !== undefined || args["allow-bot-change"] !== undefined,
             });
@@ -199,18 +220,16 @@ function required(value, label) {
         throw new Error(`${label} is required`);
     return value;
 }
-function redact(row) {
-    return { ...row, credentials_ref: row.credentials_ref ? "[redacted]" : row.credentials_ref };
-}
 function printHelp() {
     console.error(`agents-comm-bus CLI
 
 Account commands:
-  agents-comm-bus account-add --project <path> --agent <agent> --account-label <label> --bot-token <token> [--comm <comm>] [--account-id <id>]
+  agents-comm-bus account-add --project <path> --agent <agent> --account-label <label> (--bot-token <token> | --credentials-file <path.json> | --credentials-json <json>) [--comm <comm>] [--account-id <id>]
   agents-comm-bus account-list [--project <path>] [--agent <agent>] [--comm telegram]
+  agents-comm-bus account-lookup --bot-token <token> [--comm telegram] [--account-id <id>] [--json]
   agents-comm-bus account-remove [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>])
   agents-comm-bus account-relabel [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) --new-account-label <label>
-  agents-comm-bus account-update-token [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) --bot-token <token> [--account-id <id>] [--allow-bot-change]
+  agents-comm-bus account-update-token [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) (--bot-token <token> | --credentials-file <path.json> | --credentials-json <json>) [--account-id <id>] [--allow-bot-change]
 
 Allowlist commands:
   agents-comm-bus allowlist add    --comm <c> --user <id> [--note "..."]                                                      # global
@@ -224,7 +243,8 @@ Diagnostics:
   agents-comm-bus status [--json] [--state-root <path>] [--discovery-root <path>]
 
 --bot-id is canonical for per-bot commands. Label selectors are accepted only when they resolve to exactly one account.
-account-add stores --bot-token in a daemon-owned file ref; credentials_ref is not user-supplied.
+account-add and account-update-token store credentials in a daemon-owned file ref; credentials_ref is not user-supplied.
+Pass exactly one of --bot-token, --credentials-file, or --credentials-json. --bot-token is shorthand for {"botToken":"<value>"}.
 --account-id sets an explicit synthetic account id for comms without a probeable platform identity (e.g. curl, default curl:local); comms that probe a real identity ignore it.
 `);
 }

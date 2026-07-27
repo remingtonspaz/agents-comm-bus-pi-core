@@ -6,6 +6,7 @@ import { JsonlAuditStore } from "./storage/audit.js";
 import { ContentAddressedBlobStore } from "./storage/blobs.js";
 import type { AgentBridge, AgentBridgeFactory, EnsureCommsForSession } from "./runtime/agent-bridge.js";
 import type { CommAdapterFactory } from "./runtime/comm-factory.js";
+import type { CredentialResolution } from "./runtime/credential-resolution.js";
 import type { PendingInboundEntry } from "./runtime/pending-inbound.js";
 export type { AgentBridge, AgentBridgeFactory, AgentBridgeContext, } from "./runtime/agent-bridge.js";
 export type { CommAdapterFactory, CommAdapterFactoryEnv, CommIpcDeps, } from "./runtime/comm-factory.js";
@@ -84,6 +85,7 @@ export declare function addAdapterForRegistration(input: {
 } | {
     ok: false;
     reason: string;
+    resolution: CredentialResolution;
 }>;
 /**
  * AGE-38: instantiate (and lease) only the comm adapters a `(project, agent)`
@@ -100,6 +102,8 @@ export declare function ensureCommsForSession(input: {
     /** Raw project from the client, for near-miss diagnostics when it differs. */
     requestedProject?: string;
     agent: AgentId;
+    /** AGE-72: canonical serialized scope JSON, or null when unscoped. */
+    accountLabelScope?: string | null;
     factories: CommAdapterFactory[];
     /**
      * AGE-49: on-demand factory discovery when `factories` has no entry for a

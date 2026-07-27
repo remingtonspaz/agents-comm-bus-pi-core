@@ -12,8 +12,11 @@ import crypto from "node:crypto";
 import { SCHEMA_VERSION_SESSION, } from "agents-comm-bus-core";
 import { sessionLeaseOwnerWithDaemon } from "../../runtime/agent-bridge.js";
 import { normalizeProjectPath } from "../../project-path.js";
+import { accountLabelScopeFromParams, filterRegistrationsForSession, } from "../../session-label-scope.js";
 import { removePendingInboundEntries } from "../../runtime/durable-inbound.js";
 import { ClaudeWakeRegistry } from "./wake.js";
+import { ClaudeOpenQueryTracker } from "./open-query-tracker.js";
+import { createSessionOwnerLiveness, } from "../../runtime/session-owner-liveness.js";
 const DEFAULT_TTL_SECONDS = 3600;
 const CLAUDE_IPC_METHODS = new Set([
     "claude_register_session",
@@ -24,16 +27,26 @@ export class ClaudeBridge {
     options;
     agentId = "claude";
     ipcMethods = CLAUDE_IPC_METHODS;
-    wake = new ClaudeWakeRegistry();
+    wake;
     ownedAccountsCache = null;
     /** AGE-37: sequential AskUserQuestion prompts keyed by the active query id. */
     questionSequences = new Map();
+    /** AGE-36: daemon-local open-query tracking for retirement eligibility. */
+    openQueryTracker;
+    sessionOwnerIsLive;
     constructor(options) {
         this.options = options;
         // pendingInboundMax preserved as an option for symmetry but the daemon
         // now caps the shared queue itself; this class only drains it.
         void options.pendingInboundMax;
+        this.sessionOwnerIsLive =
+            options.sessionOwnerIsLive ?? createSessionOwnerLiveness();
+        this.wake = new ClaudeWakeRegistry(Date.now, this.sessionOwnerIsLive);
         this.wake.setStorage(options.storage);
+        this.openQueryTracker = new ClaudeOpenQueryTracker({
+            setTimeoutFn: options.setTimeoutFn,
+            clearTimeoutFn: options.clearTimeoutFn,
+        });
     }
     /**
      * Wire Claude-specific behaviors into the bus + per-comm callbacks. The
@@ -46,6 +59,10 @@ export class ClaudeBridge {
             onResolved: async (query, decision) => {
                 if (query.agent !== this.agentId)
                     return;
+                // Resolution is authoritative for retirement eligibility. Clear the
+                // daemon-local blocker before any wake I/O or sequencer step can fail;
+                // a resolved query must never keep this daemon alive until its TTL.
+                this.openQueryTracker.clearOpenQuery(query.query_id);
                 const payload = wakePayloadFromDecision(decision);
                 if (!payload)
                     return;
@@ -93,14 +110,17 @@ export class ClaudeBridge {
         // ClaudeBridge keeps no per-adapter state beyond the onCallback handler,
         // which is owned by the adapter and discarded when the adapter stops.
     }
+    getRetirementBlockers() {
+        return this.openQueryTracker.getRetirementBlockers();
+    }
     invalidateRegistrationCaches() {
         this.ownedAccountsCache = null;
     }
-    async onInboundConversation(conversation) {
+    async onInboundConversation(conversation, message) {
         if (conversation.agent !== this.agentId)
             return;
         try {
-            const delivered = await this.wake.wakeConversation(conversation);
+            const delivered = await this.wake.wakeConversation(conversation, message);
             if (!delivered) {
                 await this.auditWakeFailure({
                     reason: "hydration_miss",
@@ -175,9 +195,11 @@ export class ClaudeBridge {
      * Future-proofing for runtime registration would re-fetch on miss; left
      * as a follow-up.
      */
-    async ensureCommsBestEffort(project) {
+    async ensureCommsBestEffort(project, accountLabelScope) {
         try {
-            await this.options.ensureCommsForSession?.(project, this.agentId);
+            await this.options.ensureCommsForSession?.(project, this.agentId, {
+                accountLabelScope: accountLabelScope ?? null,
+            });
         }
         catch (error) {
             console.error(`agents-comm-bus: ensureCommsForSession failed for ${project}/${this.agentId}: ` +
@@ -195,10 +217,18 @@ export class ClaudeBridge {
             const sess = await this.options.storage.getSession(session);
             if (!sess)
                 return new Set();
-            const scoped = await this.options.storage.listAccountRegistrations({
-                project: sess.project,
-                agent: this.agentId,
-            });
+            const [registrations, sessions] = await Promise.all([
+                this.options.storage.listAccountRegistrations({
+                    project: sess.project,
+                    agent: this.agentId,
+                }),
+                this.options.storage.listSessions({
+                    project: sess.project,
+                    agent: this.agentId,
+                    status: "active",
+                }),
+            ]);
+            const scoped = filterRegistrationsForSession(registrations, sess, sessions, this.sessionOwnerIsLive);
             return new Set(scoped.map((reg) => `${reg.comm}:${reg.bot_user_id}`));
         }
         if (this.ownedAccountsCache)
@@ -221,6 +251,7 @@ export class ClaudeBridge {
             : typeof params.wakeDir === "string"
                 ? params.wakeDir
                 : undefined;
+        const accountLabelScope = accountLabelScopeFromParams(params);
         await this.options.storage.upsertSession({
             schema_version: SCHEMA_VERSION_SESSION,
             session_id: session,
@@ -239,21 +270,27 @@ export class ClaudeBridge {
             lease_owner_daemon_bin: null,
             lease_owner_daemon_authority_rank: null,
             most_recent_inbound_conversation_id: null,
+            account_label_scope: accountLabelScope,
             status: "active",
         });
         const acquired = await this.options.storage.acquireSessionLease(session, connectionId, now, this.options.daemonOwner
             ? sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams(params), this.options.daemonOwner)
             : sessionLeaseOwnerFromParams(params));
         if (!acquired) {
-            await this.ensureCommsBestEffort(project);
+            await this.ensureCommsBestEffort(project, accountLabelScope);
             return { ok: false, reason: "same-project claude session lease already held" };
         }
-        const registration = this.wake.register({ session, project, wakeDir });
+        const registration = this.wake.register({
+            session,
+            project,
+            wakeDir,
+            account_label_scope: accountLabelScope,
+        });
         socket?.once("close", () => {
             void this.options.storage.releaseSessionConnectionLeasePreservingOwner(session, connectionId, Date.now());
         });
         // AGE-38/AGE-45: after wake registration + close handler so inbound cannot race ahead.
-        await this.ensureCommsBestEffort(project);
+        await this.ensureCommsBestEffort(project, accountLabelScope);
         return { ok: true, wake_dir: registration.wakeDir };
     }
     async drainInbound(params) {
@@ -370,8 +407,10 @@ export class ClaudeBridge {
             // new AskUserQuestion. openNextQuestion passes supersede=false, so a
             // sequence never clears itself mid-flight.
             this.clearQuestionSequencesForSession(input.session);
+            this.openQueryTracker.clearOpenQueriesForSession(input.session);
         }
         await this.options.bus.openQuery(query);
+        this.openQueryTracker.trackOpenQuery(input.session, queryId, input.ttlSeconds);
         if (input.originChat) {
             try {
                 const inlineKeyboard = inlineKeyboardForQuery(queryId, input.kind, input.options);
@@ -411,6 +450,7 @@ export class ClaudeBridge {
                     console.error(`agents-comm-bus: failed to cancel unsent query ${queryId}: ` +
                         `${cancelError instanceof Error ? cancelError.message : String(cancelError)}`);
                 }
+                this.openQueryTracker.clearOpenQuery(queryId);
                 throw error;
             }
         }
@@ -781,6 +821,7 @@ export class ClaudeBridgeFactory {
             pendingInbound: context.pendingInbound,
             ensureCommsForSession: context.ensureCommsForSession,
             daemonOwner: context.daemonOwner,
+            sessionOwnerIsLive: context.sessionOwnerIsLive,
         });
     }
 }

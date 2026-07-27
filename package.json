@@ -1,6 +1,6 @@
 {
   "name": "@agents-comm-bus/pi-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Bundled core for agents-comm-bus Pi per-comm packages. Bundles agents-comm-bus dist/ so the whole chain resolves from git without npm.",
   "type": "module",
   "private": false,
@@ -13,6 +13,8 @@
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "license": "MIT"
 }

@@ -7,6 +7,7 @@ import { CommLeaseArbiter, inferAuthorityRank, wrapWithLease, } from "./runtime/
 import { startIpcServer } from "./ipc/server.js";
 import { writeDaemonDiscoveryFiles } from "./bootstrap/ensure-daemon.js";
 import { runBootScopeRestore } from "./bootstrap/boot-scope-restore.js";
+import { IDLE_NO_OWNED_RESOURCES_REASON, retireDaemon, } from "./bootstrap/daemon-retirement.js";
 import { startDaemonPidWatchdog } from "./bootstrap/pid-watchdog.js";
 import { MessageBus } from "./bus.js";
 import { openSqliteStorage } from "./storage/sqlite.js";
@@ -15,7 +16,11 @@ import { JsonlAuditStore } from "./storage/audit.js";
 import { ContentAddressedBlobStore } from "./storage/blobs.js";
 import { createCommFactoryRegistry } from "./runtime/comm-factory-registry.js";
 import { registerCommIpcMethods } from "./runtime/register-comm-ipc-methods.js";
+import { startIdleReaper } from "./runtime/daemon-idle-reaper.js";
+import { startSessionEndSweep } from "./runtime/session-end-sweep.js";
+import { createSessionOwnerLiveness } from "./runtime/session-owner-liveness.js";
 import { deliveryRowFromEntry, drainAndAcknowledgePendingInbound, durableInboundKey, queueHasDurableKey, rehydratePendingInboundForScope, selectPendingInboundForDrain, } from "./runtime/durable-inbound.js";
+import { filterRegistrationsByScope, } from "./session-label-scope.js";
 /**
  * Generic daemon entry point. Knows nothing about specific agents or
  * comms — adapter wiring is supplied by the composition root.
@@ -52,6 +57,7 @@ export async function runDaemon(options) {
     const audit = new JsonlAuditStore(paths.root);
     const blobs = new ContentAddressedBlobStore(paths.root);
     const pendingInbound = [];
+    const sessionOwnerIsLive = createSessionOwnerLiveness();
     // AGE-35: cross-checkout single-consumer ownership lease. A stray daemon from
     // another git checkout/worktree must not be able to poll the same Telegram bot
     // as the canonical daemon (two getUpdates consumers → 409 outage). Build ONE
@@ -109,6 +115,7 @@ export async function runDaemon(options) {
         audit,
         blobs,
         comms,
+        sessionOwnerIsLive,
     });
     // AGE-38: `bridges` is filled AFTER `ensureCommsForSession` is built because
     // the closure captures the array by reference. This is safe — the only thing
@@ -145,13 +152,15 @@ export async function runDaemon(options) {
             registerCommIpcMethods(ipcMethods, factory, ipcDeps, { commIdByMethod });
         }
     }
-    const ensureCommsForSessionFn = async (project, agent) => {
+    const ensureCommsForSessionFn = async (project, agent, options) => {
         const canonicalProject = normalizeProjectPath(project);
-        activeScopes.add(scopeKey(agent, canonicalProject));
+        const accountLabelScope = options?.accountLabelScope ?? null;
+        activeScopes.add(scopeKey(agent, canonicalProject, accountLabelScope));
         await ensureCommsForSession({
             project: canonicalProject,
             requestedProject: project,
             agent,
+            accountLabelScope,
             factories: commAdapterFactories,
             rescanFactories: rescanFactoriesForComm,
             bus,
@@ -186,6 +195,7 @@ export async function runDaemon(options) {
             daemonBin,
             authorityRank,
         },
+        sessionOwnerIsLive,
     })));
     const pendingInboundMax = 100;
     bus.setDispatchSink({
@@ -241,7 +251,7 @@ export async function runDaemon(options) {
                                 queue_length: pendingInbound.length,
                             },
                         });
-                        await bridge.onInboundConversation(conversation);
+                        await bridge.onInboundConversation(conversation, message);
                         await audit.append({
                             timestamp: Date.now(),
                             kind: "inbound_dispatch_bridge_completed",
@@ -344,16 +354,58 @@ export async function runDaemon(options) {
         throw error;
     }
     await bus.start();
-    startDaemonPidWatchdog({
+    const collectBridgeBlockers = () => {
+        const blockers = {};
+        for (const bridge of bridges) {
+            blockers[bridge.agentId] = bridge.getRetirementBlockers?.() ?? null;
+        }
+        return blockers;
+    };
+    let pidWatchdogHandle = null;
+    let idleReaperHandle = null;
+    let sessionEndSweepHandle = null;
+    const runDaemonRetirement = async (reason, recordAudit) => {
+        await retireDaemon({
+            reason,
+            port: server.port,
+            stateRoot: paths.root,
+            discoveryRoot: discoveryPaths.root,
+            audit: recordAudit ? audit : undefined,
+            stopTimers: () => {
+                pidWatchdogHandle?.stop();
+                idleReaperHandle?.stop();
+                sessionEndSweepHandle?.stop();
+            },
+            stopBus: () => bestEffortWithTimeout(() => bus.stop(), 5_000, "stop comm adapters during daemon retirement"),
+            closeIpc: () => bestEffortWithTimeout(() => server.close(), 1_000, "close IPC server during daemon retirement"),
+            closeStorage: () => storage.close(),
+        });
+    };
+    pidWatchdogHandle = startDaemonPidWatchdog({
         stateRoot: paths.root,
         discoveryRoot: discoveryPaths.root,
         pidFile: discoveryPaths.pidFile,
         port: server.port,
         audit,
         stopDaemon: async () => {
-            await bestEffortWithTimeout(() => bus.stop(), 5_000, "stop comm adapters during daemon retirement");
-            await bestEffortWithTimeout(() => server.close(), 1_000, "close IPC server during daemon retirement");
+            await runDaemonRetirement("daemon_superseded", false);
         },
+    });
+    idleReaperHandle = startIdleReaper({
+        lastIpcServedAt: () => ipcActivity.value,
+        heldLeaseCount: () => leaseArbiter.heldLeaseCount(),
+        liveIpcConnectionCount: () => server.getLiveConnectionCount(),
+        pendingInboundLength: () => pendingInbound.length,
+        inFlightAdapterCount: () => inFlightAdapters.size,
+        bridgeBlockers: collectBridgeBlockers,
+        retire: async () => {
+            await runDaemonRetirement(IDLE_NO_OWNED_RESOURCES_REASON, true);
+        },
+        log: (message) => console.error(message),
+    });
+    sessionEndSweepHandle = startSessionEndSweep({
+        storage,
+        log: (message) => console.error(message),
     });
     // AGE-55: async boot restore — never block daemon readiness on comm bring-up.
     void runBootScopeRestore({
@@ -400,7 +452,7 @@ async function bestEffortWithTimeout(action, timeoutMs, label) {
  * "already live" idempotency check before calling.
  */
 export async function addAdapterForRegistration(input) {
-    const adapter = await createAdapterFromRegistration({
+    const { adapter, resolution } = await createAdapterFromRegistration({
         factory: input.factory,
         registration: input.registration,
         env: input.env,
@@ -410,7 +462,16 @@ export async function addAdapterForRegistration(input) {
         leaseArbiter: input.leaseArbiter,
     });
     if (!adapter) {
-        return { ok: false, reason: unresolvedCredentialsReason(input.registration.credentials_ref) };
+        if (resolution.status === "invalid") {
+            logInvalidCredentialResolution(input.registration, input.factory.commId, resolution);
+        }
+        return {
+            ok: false,
+            reason: resolution.status === "invalid"
+                ? resolution.reason
+                : unresolvedCredentialsReason(input.registration.credentials_ref),
+            resolution,
+        };
     }
     const accountId = input.registration.bot_user_id;
     try {
@@ -435,6 +496,7 @@ export async function addAdapterForRegistration(input) {
         return {
             ok: false,
             reason: `failed to start adapter: ${error instanceof Error ? error.message : String(error)}`,
+            resolution,
         };
     }
 }
@@ -450,10 +512,30 @@ export async function addAdapterForRegistration(input) {
  */
 export async function ensureCommsForSession(input) {
     const project = normalizeProjectPath(input.project);
-    const registrations = await input.storage.listAccountRegistrations({
+    const accountLabelScope = input.accountLabelScope ?? null;
+    const allRegistrations = await input.storage.listAccountRegistrations({
         project,
         agent: input.agent,
     });
+    const registrations = filterRegistrationsByScope(allRegistrations, accountLabelScope);
+    if (accountLabelScope && registrations.length === 0) {
+        const message = `agents-comm-bus: account_label_scope ${accountLabelScope} has no matching ` +
+            `account registrations for project=${project} agent=${input.agent}`;
+        console.error(message);
+        await input.audit
+            ?.append({
+            timestamp: Date.now(),
+            kind: "account_label_scope_miss",
+            agent: input.agent,
+            detail: {
+                project,
+                account_label_scope: accountLabelScope,
+                registration_count: allRegistrations.length,
+            },
+        })
+            .catch(() => { });
+        throw new Error(message);
+    }
     if (registrations.length === 0) {
         await reportRegistrationProjectNearMiss({
             agent: input.agent,
@@ -510,21 +592,26 @@ export async function ensureCommsForSession(input) {
                 leaseArbiter: input.leaseArbiter,
             });
             if (!result.ok) {
-                console.error(`agents-comm-bus: ensureCommsForSession could not start ${key}: ${result.reason}`);
-                await input.audit
-                    ?.append({
-                    timestamp: Date.now(),
-                    kind: "comm_adapter_skip",
-                    agent: input.agent,
-                    detail: {
-                        comm: registration.comm,
-                        account_id: registration.bot_user_id,
-                        account_label: registration.account_label,
-                        project,
-                        reason: result.reason,
-                    },
-                })
-                    .catch(() => { });
+                if (result.resolution.status === "invalid") {
+                    await appendCredentialResolutionFailedAudit(input.audit, registration, factory.commId, result.resolution);
+                }
+                else {
+                    console.error(`agents-comm-bus: ensureCommsForSession could not start ${key}: ${result.reason}`);
+                    await input.audit
+                        ?.append({
+                        timestamp: Date.now(),
+                        kind: "comm_adapter_skip",
+                        agent: input.agent,
+                        detail: {
+                            comm: registration.comm,
+                            account_id: registration.bot_user_id,
+                            account_label: registration.account_label,
+                            project,
+                            reason: result.reason,
+                        },
+                    })
+                        .catch(() => { });
+                }
             }
         }
         finally {
@@ -537,11 +624,8 @@ async function createAdapterFromRegistration(input) {
         storage: input.storage,
         stateRoot: input.stateRoot,
     });
-    if (!resolved) {
-        const reason = unresolvedCredentialsReason(input.registration.credentials_ref);
-        console.error(`agents-comm-bus: skipping ${input.factory.commId} account ${input.registration.account_label} ` +
-            `for project ${input.registration.project} (${reason})`);
-        return null;
+    if (resolved.status !== "ok") {
+        return { adapter: null, resolution: resolved };
     }
     const adapter = input.factory.create(resolved.credentials, input.registration.bot_user_id, {
         blobs: input.blobs,
@@ -552,9 +636,9 @@ async function createAdapterFromRegistration(input) {
     // the composition root stays clean. Adapters with no exclusive backend (null)
     // pass through unwrapped.
     if (adapter.exclusiveResource?.() != null) {
-        return wrapWithLease(adapter, input.leaseArbiter);
+        return { adapter: wrapWithLease(adapter, input.leaseArbiter), resolution: resolved };
     }
-    return adapter;
+    return { adapter, resolution: resolved };
 }
 /**
  * Reconcile the live comm-adapter set with `account_registrations`. Called
@@ -593,7 +677,8 @@ export async function reloadAdapters(input) {
         const regs = await input.storage.listAccountRegistrations({ comm: factory.commId });
         for (const reg of regs) {
             const key = adapterMapKey(factory.commId, reg.bot_user_id);
-            const scopeActive = input.activeScopes?.has(scopeKey(reg.agent, reg.project)) ?? false;
+            const scopeActive = input.activeScopes != null &&
+                isRegistrationScopeActive(reg, input.activeScopes);
             if (!current.has(key) && !scopeActive)
                 continue; // inactive project → stay lazy
             if (!desired.has(key))
@@ -628,21 +713,26 @@ export async function reloadAdapters(input) {
                 account_id: entry.registration.bot_user_id,
                 reason: result.reason,
             });
-            await input.audit
-                ?.append({
-                timestamp: Date.now(),
-                kind: "comm_adapter_skip",
-                agent: entry.registration.agent,
-                detail: {
-                    comm: entry.registration.comm,
-                    account_id: entry.registration.bot_user_id,
-                    account_label: entry.registration.account_label,
-                    project: entry.registration.project,
-                    reason: result.reason,
-                    via: "reload_registrations",
-                },
-            })
-                .catch(() => { });
+            if (result.resolution.status === "invalid") {
+                await appendCredentialResolutionFailedAudit(input.audit, entry.registration, entry.registration.comm, result.resolution);
+            }
+            else {
+                await input.audit
+                    ?.append({
+                    timestamp: Date.now(),
+                    kind: "comm_adapter_skip",
+                    agent: entry.registration.agent,
+                    detail: {
+                        comm: entry.registration.comm,
+                        account_id: entry.registration.bot_user_id,
+                        account_label: entry.registration.account_label,
+                        project: entry.registration.project,
+                        reason: result.reason,
+                        via: "reload_registrations",
+                    },
+                })
+                    .catch(() => { });
+            }
         }
     }
     for (const [key, entry] of current) {
@@ -676,7 +766,7 @@ export async function reloadAdapters(input) {
         if (!current.has(key))
             continue;
         if (forceCredentialRefresh.has(key)) {
-            const adapter = await createAdapterFromRegistration({
+            const { adapter, resolution } = await createAdapterFromRegistration({
                 factory: entry.factory,
                 registration: entry.registration,
                 env: input.env,
@@ -686,10 +776,16 @@ export async function reloadAdapters(input) {
                 leaseArbiter: input.leaseArbiter,
             });
             if (!adapter) {
+                if (resolution.status === "invalid") {
+                    logInvalidCredentialResolution(entry.registration, entry.registration.comm, resolution);
+                    await appendCredentialResolutionFailedAudit(input.audit, entry.registration, entry.registration.comm, resolution);
+                }
                 skipped.push({
                     comm: entry.registration.comm,
                     account_id: entry.registration.bot_user_id,
-                    reason: unresolvedCredentialsReason(entry.registration.credentials_ref, "re-resolve"),
+                    reason: resolution.status === "invalid"
+                        ? resolution.reason
+                        : unresolvedCredentialsReason(entry.registration.credentials_ref, "re-resolve"),
                 });
                 continue;
             }
@@ -755,17 +851,23 @@ export async function reloadAdapters(input) {
             storage: input.storage,
             stateRoot: input.stateRoot,
         });
-        if (!resolved) {
+        if (resolved.status !== "ok") {
             // Symmetric with the attach branch: surface credential resolution
             // failures so a credentials_ref that broke between attach time and
             // reload time doesn't disappear silently. The live adapter keeps
             // running on its prior allowlist (no destructive action), but the
             // reload IPC caller learns that this registration's runtime state
             // is now stale.
+            if (resolved.status === "invalid") {
+                logInvalidCredentialResolution(entry.registration, entry.registration.comm, resolved);
+                await appendCredentialResolutionFailedAudit(input.audit, entry.registration, entry.registration.comm, resolved);
+            }
             skipped.push({
                 comm: entry.registration.comm,
                 account_id: entry.registration.bot_user_id,
-                reason: unresolvedCredentialsReason(entry.registration.credentials_ref, "re-resolve"),
+                reason: resolved.status === "invalid"
+                    ? resolved.reason
+                    : unresolvedCredentialsReason(entry.registration.credentials_ref, "re-resolve"),
             });
             continue;
         }
@@ -842,10 +944,10 @@ async function resolveOwnedAccountKeys(storage, session) {
     const sess = await storage.getSession(session);
     if (!sess)
         return new Set();
-    const regs = await storage.listAccountRegistrations({
+    const regs = filterRegistrationsByScope(await storage.listAccountRegistrations({
         project: sess.project,
         agent: sess.agent,
-    });
+    }), sess.account_label_scope);
     return new Set(regs.map((reg) => `${reg.comm}:${reg.bot_user_id}`));
 }
 function sameStringSet(a, b) {
@@ -865,14 +967,51 @@ function unresolvedCredentialsReason(ref, action = "resolve") {
     }
     return `could not ${action} credentials_ref=${ref}`;
 }
+function logInvalidCredentialResolution(registration, commId, resolution) {
+    const pathSuffix = resolution.path ? ` [${resolution.path}]` : "";
+    console.error(`agents-comm-bus: credential file for ${commId} account ${registration.account_label} ` +
+        `(project ${registration.project}) exists but failed to resolve: ${resolution.reason}${pathSuffix}`);
+}
+async function appendCredentialResolutionFailedAudit(audit, registration, commId, resolution) {
+    await audit
+        ?.append({
+        timestamp: Date.now(),
+        kind: "credential_resolution_failed",
+        agent: registration.agent,
+        detail: {
+            comm: commId,
+            account_label: registration.account_label,
+            project: registration.project,
+            bot_user_id: registration.bot_user_id,
+            credential_path: resolution.path ?? null,
+            failure_kind: resolution.failureKind,
+            reason: resolution.reason,
+        },
+    })
+        .catch(() => { });
+}
 function adapterMapKey(commId, accountId) {
     return `${commId}:${accountId}`;
 }
-// AGE-38: key for the active-(project, agent)-scope set used to gate reload
-// hot-adds. A scope is "active" once a session for it has registered this
-// daemon-lifetime.
-function scopeKey(agent, project) {
-    return `${agent}:${normalizeProjectPath(project)}`;
+// AGE-38/AGE-72: key for the active-(project, agent[, label-scope]) set used to
+// gate reload hot-adds.
+function scopeKey(agent, project, accountLabelScope) {
+    return `${agent}:${normalizeProjectPath(project)}:${accountLabelScope ?? ""}`;
+}
+function isRegistrationScopeActive(registration, activeScopes) {
+    const prefix = `${registration.agent}:${normalizeProjectPath(registration.project)}:`;
+    const legacyKey = `${registration.agent}:${normalizeProjectPath(registration.project)}`;
+    for (const key of activeScopes) {
+        if (key === legacyKey)
+            return true;
+        if (!key.startsWith(prefix))
+            continue;
+        const scopeStored = key.slice(prefix.length);
+        const scope = scopeStored.length > 0 ? scopeStored : null;
+        if (filterRegistrationsByScope([registration], scope).length > 0)
+            return true;
+    }
+    return false;
 }
 async function reportRegistrationProjectNearMiss(input) {
     const allForAgent = await input.storage.listAccountRegistrations({ agent: input.agent });
@@ -921,7 +1060,10 @@ export async function handleEnsureCommsForScope(params, ensureCommsForSession) {
         ? params.agent
         : "claude");
     const canonicalProject = normalizeProjectPath(rawProject);
-    await ensureCommsForSession(canonicalProject, agent);
+    const accountLabelScope = typeof params.account_label_scope === "string" || params.account_label_scope === null
+        ? params.account_label_scope
+        : null;
+    await ensureCommsForSession(canonicalProject, agent, { accountLabelScope });
     return { ok: true, project: canonicalProject, agent };
 }
 async function dispatchIpc(request, context) {

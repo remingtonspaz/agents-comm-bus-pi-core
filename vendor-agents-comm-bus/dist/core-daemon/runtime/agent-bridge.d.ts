@@ -1,7 +1,14 @@
-import type { AccountId, AgentId, AuditStore, CommAdapter, CommId, Conversation, Storage } from "agents-comm-bus-core";
+import type { AccountId, AgentId, AuditStore, CommAdapter, CommId, Conversation, Message, Storage } from "agents-comm-bus-core";
 import type { SessionLeaseOwner } from "agents-comm-bus-core/storage/storage";
 import type { MessageBus } from "../bus.js";
 import type { PendingInboundEntry } from "./pending-inbound.js";
+import type { SessionOwnerLiveness } from "./session-owner-liveness.js";
+/** Daemon-local retirement blockers: stable reason key → count (AGE-36). */
+export type RetirementBlockerSnapshot = Readonly<Record<string, number>>;
+export type EnsureCommsForSessionOptions = {
+    /** Canonical serialized account_label_scope JSON, or null when unscoped. */
+    accountLabelScope?: string | null;
+};
 /**
  * Lazily bring up the comm adapters a `(project, agent)` session needs, on
  * session entry. AGE-38: the daemon no longer eager-loads every registered bot
@@ -9,7 +16,7 @@ import type { PendingInboundEntry } from "./pending-inbound.js";
  * the daemon instantiates (and leases) only the bots its live sessions use.
  * Idempotent — safe to call on every register (hooks register frequently).
  */
-export type EnsureCommsForSession = (project: string, agent: AgentId) => Promise<void>;
+export type EnsureCommsForSession = (project: string, agent: AgentId, options?: EnsureCommsForSessionOptions) => Promise<void>;
 /** Resolved daemon self-identity; stamped onto sessions at lease acquire (AGE-58). */
 export interface DaemonSelfIdentity {
     discoveryRoot: string;
@@ -27,6 +34,8 @@ export interface AgentBridgeContext {
     ensureCommsForSession: EnsureCommsForSession;
     /** AGE-58: daemon-resolved identity for session ownership stamping. */
     daemonOwner: DaemonSelfIdentity;
+    /** AGE-81: live connection or recent, still-running durable owner process. */
+    sessionOwnerIsLive: SessionOwnerLiveness;
 }
 export interface AgentBridge {
     /** Agent id this bridge handles (e.g. `"claude"`). */
@@ -64,15 +73,22 @@ export interface AgentBridge {
     /**
      * Optional: notification that a fresh inbound conversation just landed.
      * Bridges can use this to wake the agent (e.g. ClaudeBridge writes a
-     * `trigger-enter` file).
+     * `trigger-enter` file). `message` is the inbound message that triggered
+     * the dispatch — ClaudeBridge uses its text as the verbatim wake seed
+     * (AGE-65). Optional so existing bridges can ignore it.
      */
-    onInboundConversation?(conversation: Conversation): Promise<void>;
+    onInboundConversation?(conversation: Conversation, message?: Message): Promise<void>;
     /** Handle an IPC method that this bridge advertised in `ipcMethods`. */
     handleIpcMethod(method: string, params: Record<string, unknown>, ctx: {
         socket?: {
             once(event: "close", handler: () => void): void;
         };
     }): Promise<unknown>;
+    /**
+     * Optional (AGE-36): daemon-local retirement blockers. Absent or null means no
+     * blocker from this bridge. Must not consult the shared DB for global counts.
+     */
+    getRetirementBlockers?(): RetirementBlockerSnapshot | null;
 }
 export interface AgentBridgeFactory {
     readonly agentId: AgentId;

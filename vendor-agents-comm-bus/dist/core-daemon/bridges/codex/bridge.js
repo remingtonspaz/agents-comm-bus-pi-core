@@ -1,10 +1,13 @@
 import crypto from "node:crypto";
 import { SCHEMA_VERSION_SESSION, } from "agents-comm-bus-core";
 import { normalizeProjectPath } from "../../project-path.js";
+import { accountLabelScopeFromParams, filterRegistrationsForSession, resolveSessionForConversation, } from "../../session-label-scope.js";
 import { removePendingInboundEntries } from "../../runtime/durable-inbound.js";
 import { sessionLeaseOwnerWithDaemon } from "../../runtime/agent-bridge.js";
 import { CodexAgentAdapter, codexDecisionFromResolution, codexHookDecision, } from "./adapter.js";
 import { cleanupManagedCodexAppServer } from "./app-server-lifecycle.js";
+import { sessionEndObservation } from "../../runtime/session-end-sweep.js";
+import { createSessionOwnerLiveness, } from "../../runtime/session-owner-liveness.js";
 const DEFAULT_TTL_SECONDS = 3600;
 const DEFAULT_QUERY_POLL_TIMEOUT_MS = 9 * 60 * 1000;
 const DEFAULT_APP_SERVER_CLEANUP_DELAY_MS = 3_000;
@@ -22,12 +25,18 @@ export class CodexBridge {
     ipcMethods = CODEX_IPC_METHODS;
     adapter;
     waiters = new Map();
-    sessionsByProject = new Map();
+    sessionRoutes = new Map();
     activeLeases = new Map();
     ownedAccountsCache = null;
     ownerCheckTimer = null;
+    /** AGE-36: scheduled / in-flight managed app-server cleanup counters. */
+    pendingManagedCleanups = 0;
+    inFlightManagedCleanups = 0;
+    sessionOwnerIsLive;
     constructor(options) {
         this.options = options;
+        this.sessionOwnerIsLive =
+            options.sessionOwnerIsLive ?? createSessionOwnerLiveness();
         this.adapter = new CodexAgentAdapter({
             defaultAppServerUrl: options.defaultAppServerUrl ?? process.env.CODEX_APP_SERVER_URL,
             appServerClientFactory: options.appServerClientFactory,
@@ -58,18 +67,29 @@ export class CodexBridge {
     invalidateRegistrationCaches() {
         this.ownedAccountsCache = null;
     }
+    getRetirementBlockers() {
+        const blockers = {};
+        const managedLifecycle = [...this.activeLeases.values()].some((lease) => !lease.released && lease.manageAppServerLifecycle);
+        if (this.waiters.size > 0)
+            blockers.open_queries = this.waiters.size;
+        if (managedLifecycle)
+            blockers.managed_lifecycle = 1;
+        if (this.pendingManagedCleanups > 0 || this.inFlightManagedCleanups > 0) {
+            blockers.pending_managed_cleanup = 1;
+        }
+        return Object.keys(blockers).length > 0 ? blockers : null;
+    }
     async onInboundConversation(conversation) {
         if (conversation.agent !== this.agentId)
             return;
-        const sessions = this.sessionsByProject.get(normalizeProjectPath(conversation.project));
-        const session = sessions?.values().next().value;
+        const session = await this.resolveSessionForConversation(conversation);
         if (!session) {
             await this.auditWake("agent_wake_skipped", conversation, undefined, {
                 reason: "no_codex_session_for_project",
             });
             return;
         }
-        const pendingForSession = await this.pendingInboundForConversation(conversation);
+        const pendingForSession = await this.pendingInboundForConversation(conversation, session);
         const mostRecentConversationId = pendingForSession.at(-1)?.conversation.conversation_id ?? conversation.conversation_id;
         await this.options.storage.setSessionMostRecentInbound(session, mostRecentConversationId);
         await this.auditWake("agent_wake_attempt", conversation, session, {
@@ -91,7 +111,7 @@ export class CodexBridge {
                     pending_count: pendingForSession.length,
                     removed_pending_count: pendingForSession.length,
                 });
-                await this.removePendingInbound(pendingForSession);
+                await this.removePendingInbound(session, pendingForSession);
             }
         }
         catch (error) {
@@ -122,10 +142,31 @@ export class CodexBridge {
     }
     async bootstrapStatus(params) {
         const project = normalizeProjectPath(requiredString(params.project, "project"));
-        const registrations = await this.options.storage.listAccountRegistrations({
+        const accountLabelScope = accountLabelScopeFromParams(params);
+        const [registrations, sessions] = await Promise.all([
+            this.options.storage.listAccountRegistrations({
+                project,
+                agent: this.agentId,
+            }),
+            this.options.storage.listSessions({
+                project,
+                agent: this.agentId,
+                status: "active",
+            }),
+        ]);
+        const scopedRegistrations = filterRegistrationsForSession(registrations, {
+            // SessionStart runs before registration and may not have a managed
+            // session id yet. Use a non-persisted identity so every live session
+            // remains a sibling candidate for precedence.
+            session_id: "__codex_bootstrap_status__",
             project,
             agent: this.agentId,
-        });
+            account_label_scope: accountLabelScope,
+            status: "active",
+            lease_holder_connection_id: null,
+            lease_owner_process_pid: null,
+            lease_owner_process_registered_at: null,
+        }, sessions, this.sessionOwnerIsLive);
         const hasAppServerUrl = typeof params.app_server_url === "string" &&
             params.app_server_url.trim().length > 0;
         const hasManagedSession = typeof params.managed_session_id === "string" &&
@@ -133,12 +174,12 @@ export class CodexBridge {
         const managedAppServerPresent = hasAppServerUrl &&
             hasManagedSession &&
             params.app_server_reachable === true;
-        const hasAccountRegistration = registrations.length > 0;
+        const hasAccountRegistration = scopedRegistrations.length > 0;
         const bootstrapRequired = hasAccountRegistration && !managedAppServerPresent;
         return {
             ok: true,
             has_account_registration: hasAccountRegistration,
-            registration_count: registrations.length,
+            registration_count: scopedRegistrations.length,
             managed_app_server_present: managedAppServerPresent,
             bootstrap_required: bootstrapRequired,
             reason: !hasAccountRegistration
@@ -155,6 +196,7 @@ export class CodexBridge {
             ? params.connection_id
             : `codex:${session}:${crypto.randomUUID()}`;
         const now = Date.now();
+        const accountLabelScope = accountLabelScopeFromParams(params);
         await this.options.storage.upsertSession({
             schema_version: SCHEMA_VERSION_SESSION,
             session_id: session,
@@ -173,6 +215,7 @@ export class CodexBridge {
             lease_owner_daemon_bin: null,
             lease_owner_daemon_authority_rank: null,
             most_recent_inbound_conversation_id: null,
+            account_label_scope: accountLabelScope,
             status: "active",
         });
         const replaceExistingLease = params.replace_existing_lease === true ||
@@ -193,12 +236,12 @@ export class CodexBridge {
                 await this.options.storage.releaseSessionLease(session, existing.lease_holder_connection_id, now);
                 const reacquired = await this.options.storage.acquireSessionLease(session, connectionId, now, leaseOwner);
                 if (!reacquired) {
-                    await this.ensureCommsBestEffort(project);
+                    await this.ensureCommsBestEffort(project, accountLabelScope);
                     return { ok: false, reason: "same-project codex session lease already held" };
                 }
             }
             else if (existing?.lease_holder_connection_id) {
-                await this.ensureCommsBestEffort(project);
+                await this.ensureCommsBestEffort(project, accountLabelScope);
                 return {
                     ok: true,
                     reason: "codex session lease already held; registration refreshed",
@@ -206,7 +249,7 @@ export class CodexBridge {
                 };
             }
             else {
-                await this.ensureCommsBestEffort(project);
+                await this.ensureCommsBestEffort(project, accountLabelScope);
                 return { ok: false, reason: "same-project codex session lease already held" };
             }
         }
@@ -215,9 +258,9 @@ export class CodexBridge {
         if (typeof params.app_server_url === "string") {
             this.adapter.setAppServerUrl(session, params.app_server_url);
         }
-        this.trackSession(project, session);
+        this.trackSession(project, session, accountLabelScope);
         // AGE-38/AGE-45: after connect + trackSession so inbound cannot race ahead of setup.
-        await this.ensureCommsBestEffort(project);
+        await this.ensureCommsBestEffort(project, accountLabelScope);
         const persistAfterDisconnect = params.persist_after_disconnect === true;
         const manageAppServerLifecycle = params.manage_app_server_lifecycle === true ||
             params.source === "mcp-server";
@@ -293,35 +336,41 @@ export class CodexBridge {
             await this.options.storage.supersedeOpenQueriesForSession(session, Date.now());
         }
         const resolutionPromise = this.waitForResolution(queryId, query.ttl_seconds);
-        await this.options.bus.openQuery(query);
-        const promptFormat = params.prompt_format ?? queryInput.prompt_format;
-        const promptMessageId = await this.options.bus.send({
-            session,
-            comm: originChat.comm,
-            target: originChat,
-            payload: {
-                text: promptText,
-                format: promptFormat === "html" ? "html" : "plain",
-                inline_keyboard: inlineKeyboardForQuery(queryId),
-            },
-            idempotencyKey: `query:${queryId}`,
-        });
-        // AGE-9: activate reply-to targeting for this prompt (best-effort).
         try {
-            await this.options.storage.setQuerySourceMessage(queryId, promptMessageId);
+            await this.options.bus.openQuery(query);
+            const promptFormat = params.prompt_format ?? queryInput.prompt_format;
+            const promptMessageId = await this.options.bus.send({
+                session,
+                comm: originChat.comm,
+                target: originChat,
+                payload: {
+                    text: promptText,
+                    format: promptFormat === "html" ? "html" : "plain",
+                    inline_keyboard: inlineKeyboardForQuery(queryId),
+                },
+                idempotencyKey: `query:${queryId}`,
+            });
+            // AGE-9: activate reply-to targeting for this prompt (best-effort).
+            try {
+                await this.options.storage.setQuerySourceMessage(queryId, promptMessageId);
+            }
+            catch (error) {
+                console.error(`agents-comm-bus: failed to record prompt message id for ${queryId}: ` +
+                    `${error instanceof Error ? error.message : String(error)}`);
+            }
+            const decision = await resolutionPromise;
+            const hookResponse = codexDecisionFromResolution(decision);
+            return {
+                query_id: queryId,
+                hook_response: hookResponse,
+                hookJson: hookResponse,
+                nativeHookJson: hookResponse,
+            };
         }
         catch (error) {
-            console.error(`agents-comm-bus: failed to record prompt message id for ${queryId}: ` +
-                `${error instanceof Error ? error.message : String(error)}`);
+            this.clearWaiter(queryId);
+            throw error;
         }
-        const decision = await resolutionPromise;
-        const hookResponse = codexDecisionFromResolution(decision);
-        return {
-            query_id: queryId,
-            hook_response: hookResponse,
-            hookJson: hookResponse,
-            nativeHookJson: hookResponse,
-        };
     }
     async turnControl(params) {
         const session = requiredString(params.session, "session");
@@ -387,37 +436,68 @@ export class CodexBridge {
         const timeoutMs = Math.min(this.options.queryPollTimeoutMs ?? DEFAULT_QUERY_POLL_TIMEOUT_MS, Math.max(1, ttlSeconds) * 1000);
         return new Promise((resolve) => {
             const timer = setTimeout(() => {
-                this.waiters.delete(queryId);
+                this.clearWaiter(queryId);
                 resolve(null);
             }, timeoutMs);
+            timer.unref?.();
             this.waiters.set(queryId, (decision) => {
                 clearTimeout(timer);
-                this.waiters.delete(queryId);
+                this.clearWaiter(queryId);
                 resolve(decision);
             });
         });
     }
-    async ensureCommsBestEffort(project) {
+    clearWaiter(queryId) {
+        this.waiters.delete(queryId);
+    }
+    async ensureCommsBestEffort(project, accountLabelScope) {
         try {
-            await this.options.ensureCommsForSession?.(project, this.agentId);
+            await this.options.ensureCommsForSession?.(project, this.agentId, {
+                accountLabelScope: accountLabelScope ?? null,
+            });
         }
         catch (error) {
             console.error(`agents-comm-bus: ensureCommsForSession failed for ${project}/${this.agentId}: ` +
                 `${error instanceof Error ? error.message : String(error)}`);
         }
     }
-    trackSession(project, session) {
-        const sessions = this.sessionsByProject.get(project) ?? new Set();
-        sessions.add(session);
-        this.sessionsByProject.set(project, sessions);
+    trackSession(project, session, accountLabelScope) {
+        this.sessionRoutes.set(session, {
+            project,
+            account_label_scope: accountLabelScope,
+        });
     }
     untrackSession(project, session) {
-        const sessions = this.sessionsByProject.get(project);
-        if (!sessions)
+        const route = this.sessionRoutes.get(session);
+        if (!route || route.project !== project)
             return;
-        sessions.delete(session);
-        if (sessions.size === 0)
-            this.sessionsByProject.delete(project);
+        this.sessionRoutes.delete(session);
+    }
+    async resolveSessionForConversation(conversation) {
+        const project = normalizeProjectPath(conversation.project);
+        const inMemory = [...this.sessionRoutes.entries()]
+            .filter(([, route]) => route.project === project)
+            .map(([sessionId, route]) => ({
+            session_id: sessionId,
+            project: route.project,
+            agent: this.agentId,
+            account_label_scope: route.account_label_scope,
+        }));
+        const fromMemory = resolveSessionForConversation(inMemory, conversation, (sess) => sess.session_id);
+        if (fromMemory)
+            return fromMemory.session_id;
+        const sessions = await this.options.storage.listSessions({
+            project,
+            agent: this.agentId,
+            status: "active",
+        });
+        const live = sessions.filter((sess) => sess.lease_holder_connection_id != null);
+        const pool = live.length > 0 ? live : sessions;
+        const hydrated = resolveSessionForConversation(pool, conversation, (sess) => sess.session_id);
+        if (!hydrated)
+            return undefined;
+        this.trackSession(project, hydrated.session_id, hydrated.account_label_scope);
+        return hydrated.session_id;
     }
     async releaseSessionLease(input) {
         if (input.released)
@@ -430,7 +510,16 @@ export class CodexBridge {
                 this.activeLeases.delete(input.session);
             }
             await this.adapter.disconnect(input.session);
-            await this.options.storage.releaseSessionLease(input.session, input.connectionId, Date.now());
+            if (input.manageAppServerLifecycle) {
+                // AGE-82: a managed release schedules cleanup, which ends the row.
+                // `releaseSessionLease` NULLs every owner/daemon stamp, so ending a
+                // row released that way would scrub exactly the forensics the sweep is
+                // required to preserve. Keep the stamps until the row is truly ended.
+                await this.options.storage.releaseSessionConnectionLeasePreservingOwner(input.session, input.connectionId, Date.now());
+            }
+            else {
+                await this.options.storage.releaseSessionLease(input.session, input.connectionId, Date.now());
+            }
             input.control.close();
             if (input.manageAppServerLifecycle) {
                 this.scheduleManagedAppServerCleanup(input.session);
@@ -491,17 +580,34 @@ export class CodexBridge {
     }
     scheduleManagedAppServerCleanup(session) {
         const delay = this.options.appServerCleanupDelayMs ?? DEFAULT_APP_SERVER_CLEANUP_DELAY_MS;
-        const timer = setTimeout(() => {
-            void this.cleanupManagedAppServerIfLeaseIsIdle(session);
+        this.pendingManagedCleanups += 1;
+        const setTimeoutFn = this.options.setTimeoutFn ??
+            ((fn, ms) => {
+                const handle = setTimeout(fn, ms);
+                handle.unref?.();
+                return handle;
+            });
+        setTimeoutFn(() => {
+            this.pendingManagedCleanups -= 1;
+            this.inFlightManagedCleanups += 1;
+            void this.cleanupManagedAppServerIfLeaseIsIdle(session).finally(() => {
+                this.inFlightManagedCleanups -= 1;
+            });
         }, delay);
-        timer.unref?.();
     }
     async cleanupManagedAppServerIfLeaseIsIdle(session) {
         try {
             const record = await this.options.storage.getSession(session);
             if (record?.lease_holder_connection_id)
                 return;
-            await cleanupManagedCodexAppServer(session);
+            const result = await cleanupManagedCodexAppServer(session);
+            if (!result.ok)
+                return;
+            const latest = await this.options.storage.getSession(session);
+            if (!latest || latest.status !== "active" || latest.lease_holder_connection_id) {
+                return;
+            }
+            await this.options.storage.endSessionIfUnchanged(session, sessionEndObservation(latest), Date.now());
         }
         catch (error) {
             console.error(`agents-comm-bus: failed to cleanup Codex app-server for ${session}: ` +
@@ -557,8 +663,8 @@ export class CodexBridge {
                 `${error instanceof Error ? error.message : String(error)}`);
         }
     }
-    async pendingInboundForConversation(conversation) {
-        const owned = await this.ownedAccountKeys();
+    async pendingInboundForConversation(conversation, session) {
+        const owned = await this.ownedAccountKeys(session);
         return this.options.pendingInbound.filter((entry) => owned.has(accountKey(entry)) &&
             entry.conversation.project === conversation.project);
     }
@@ -577,10 +683,18 @@ export class CodexBridge {
             const sess = await this.options.storage.getSession(session);
             if (!sess)
                 return new Set();
-            const scoped = await this.options.storage.listAccountRegistrations({
-                project: sess.project,
-                agent: this.agentId,
-            });
+            const [registrations, sessions] = await Promise.all([
+                this.options.storage.listAccountRegistrations({
+                    project: sess.project,
+                    agent: this.agentId,
+                }),
+                this.options.storage.listSessions({
+                    project: sess.project,
+                    agent: this.agentId,
+                    status: "active",
+                }),
+            ]);
+            const scoped = filterRegistrationsForSession(registrations, sess, sessions, this.sessionOwnerIsLive);
             return new Set(scoped.map((reg) => `${reg.comm}:${reg.bot_user_id}`));
         }
         if (this.ownedAccountsCache)
@@ -591,14 +705,14 @@ export class CodexBridge {
         this.ownedAccountsCache = new Set(registrations.map((reg) => `${reg.comm}:${reg.bot_user_id}`));
         return this.ownedAccountsCache;
     }
-    async removePendingInbound(entries) {
+    async removePendingInbound(session, entries) {
         if (entries.length === 0)
             return;
         // Scope removal by durable delivery key (message_id + comm + account) so
         // we only remove Codex-owned entries. The same Telegram message can
         // appear in pendingInbound twice when multiple bots in the same chat each
         // receive the update.
-        const owned = await this.ownedAccountKeys();
+        const owned = await this.ownedAccountKeys(session);
         const scoped = entries.filter((entry) => owned.has(accountKey(entry)));
         await removePendingInboundEntries(this.options.storage, this.options.pendingInbound, scoped);
     }
@@ -767,6 +881,7 @@ export class CodexBridgeFactory {
             pendingInbound: context.pendingInbound,
             ensureCommsForSession: context.ensureCommsForSession,
             daemonOwner: context.daemonOwner,
+            sessionOwnerIsLive: context.sessionOwnerIsLive,
         });
     }
 }
