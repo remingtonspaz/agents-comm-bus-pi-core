@@ -1,3 +1,4 @@
+import { compareProcessStartIdentity, } from "./process-start-epoch.js";
 /** Match boot-scope restore's existing 24-hour owner recency window. */
 export const DEFAULT_SESSION_OWNER_RECENCY_MS = 24 * 60 * 60 * 1000;
 export function defaultIsPidAlive(pid) {
@@ -17,13 +18,39 @@ export function defaultIsPidAlive(pid) {
 export function classifySessionOwnerProcess(session, options = {}) {
     const pid = session.lease_owner_process_pid;
     const registeredAt = session.lease_owner_process_registered_at;
+    const startTime = session.lease_owner_process_start_time;
     if (pid == null || registeredAt == null)
         return "no_owner";
     const isPidAlive = options.isPidAlive ?? defaultIsPidAlive;
-    // TODO(AGE-55): process-start-time verification would close PID reuse inside
-    // the recency window; Node has no clean cross-platform built-in for it.
     if (!isPidAlive(pid))
         return "dead";
+    if (startTime != null) {
+        const identityOptions = {
+            readProcStat: options.readProcStat,
+            readBootId: options.readBootId,
+            readProcUptime: options.readProcUptime,
+            readClockTicksPerSec: options.readClockTicksPerSec,
+        };
+        const compare = options.readProcessStartEpochMs
+            ? (() => {
+                const current = options.readProcessStartEpochMs(pid);
+                if (current == null)
+                    return "inconclusive";
+                return current === startTime ? "match" : "mismatch";
+            })()
+            : compareProcessStartIdentity(startTime, pid, identityOptions);
+        if (compare === "mismatch")
+            return "dead";
+        // Identity confirmed: the exact process that registered is still running.
+        // Recency was only ever a pid-reuse proxy; with a start-time match it adds
+        // nothing and would mark an idle-but-alive owner "stale", which the live
+        // scope-release path then treated as gone (adapters stopped under a
+        // running Claude session that had not submitted a prompt for 24h).
+        if (compare === "match")
+            return "live";
+    }
+    // No start-time identity (legacy rows) or an inconclusive probe: keep the
+    // recency window as the pid-reuse guard.
     const now = options.now ?? Date.now;
     const recencyMs = options.recencyMs ?? DEFAULT_SESSION_OWNER_RECENCY_MS;
     if (now() - registeredAt > recencyMs)

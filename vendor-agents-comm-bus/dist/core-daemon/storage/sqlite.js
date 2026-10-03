@@ -1,5 +1,7 @@
 import { createRequire } from "node:module";
 import { normalizeProjectPath } from "../project-path.js";
+import { parseHerdrIdentityJson } from "../runtime/herdr.js";
+import { readProcessStartEpochMs, prefetchProcessStartIdentity } from "../runtime/process-start-epoch.js";
 import { runStorageMigrations } from "./schema/runner.js";
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require("node:sqlite");
@@ -40,8 +42,8 @@ export class SqliteStorage {
             .prepare(`
         INSERT INTO account_registrations (
           schema_version, registration_id, project, comm, agent, account_label,
-          bot_user_id, credentials_ref, bot_username, created_at, updated_at, metadata_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          bot_user_id, credentials_ref, activation, bot_username, created_at, updated_at, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(project, comm, agent, account_label) DO UPDATE SET
           bot_user_id = excluded.bot_user_id,
           credentials_ref = excluded.credentials_ref,
@@ -49,12 +51,18 @@ export class SqliteStorage {
           updated_at = excluded.updated_at,
           metadata_json = excluded.metadata_json
       `)
-            .run(rec.schema_version, rec.registration_id ?? null, project, rec.comm, rec.agent, rec.account_label, rec.bot_user_id, rec.credentials_ref, rec.bot_username ?? null, rec.created_at, rec.updated_at, encodeJson(rec.metadata));
+            .run(rec.schema_version, rec.registration_id ?? null, project, rec.comm, rec.agent, rec.account_label, rec.bot_user_id, rec.credentials_ref, rec.activation ?? "lazy", rec.bot_username ?? null, rec.created_at, rec.updated_at, encodeJson(rec.metadata));
     }
     async getAccountByBot(comm, bot_user_id) {
         const row = this.db
             .prepare("SELECT * FROM account_registrations WHERE comm = ? AND bot_user_id = ?")
             .get(comm, bot_user_id);
+        return row ? this.accountFromRow(row) : null;
+    }
+    async getAccountByRegistrationId(registration_id) {
+        const row = this.db
+            .prepare("SELECT * FROM account_registrations WHERE registration_id = ?")
+            .get(registration_id);
         return row ? this.accountFromRow(row) : null;
     }
     async listAccountRegistrations(filter = {}) {
@@ -211,6 +219,45 @@ export class SqliteStorage {
                 .run(input.account_label, input.updated_at, previous.registration_id);
             if (Number(result.changes ?? 0) !== 1) {
                 throw new Error(`failed to relabel account registration for ${input.comm}/${input.bot_user_id}`);
+            }
+            const nextRow = this.db
+                .prepare("SELECT * FROM account_registrations WHERE registration_id = ?")
+                .get(previous.registration_id);
+            if (!nextRow) {
+                throw new Error(`updated account registration not found for ${previous.registration_id}`);
+            }
+            this.db.exec("COMMIT");
+            return { previous, next: this.accountFromRow(nextRow) };
+        }
+        catch (error) {
+            this.db.exec("ROLLBACK");
+            throw error;
+        }
+    }
+    async updateAccountRegistrationActivation(input) {
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+            const previousRow = this.db
+                .prepare("SELECT * FROM account_registrations WHERE comm = ? AND bot_user_id = ?")
+                .get(input.comm, input.bot_user_id);
+            if (!previousRow) {
+                throw new Error(`no account registration found for (comm=${input.comm}, bot-id=${input.bot_user_id})`);
+            }
+            const previous = this.accountFromRow(previousRow);
+            if (previous.activation === input.activation) {
+                this.db.exec("COMMIT");
+                return { previous, next: previous };
+            }
+            const result = this.db
+                .prepare(`
+          UPDATE account_registrations
+          SET activation = ?,
+              updated_at = ?
+          WHERE registration_id = ?
+        `)
+                .run(input.activation, input.updated_at, previous.registration_id);
+            if (Number(result.changes ?? 0) !== 1) {
+                throw new Error(`failed to update activation for account registration ${previous.registration_id}`);
             }
             const nextRow = this.db
                 .prepare("SELECT * FROM account_registrations WHERE registration_id = ?")
@@ -500,21 +547,27 @@ export class SqliteStorage {
           schema_version, session_id, agent, project, created_at,
           lease_holder_connection_id, lease_acquired_at, lease_released_at,
           lease_owner_process_pid, lease_owner_process_label,
-          lease_owner_process_registered_at,
+          lease_owner_process_registered_at, lease_owner_process_start_time,
           lease_owner_daemon_discovery_root, lease_owner_daemon_checkout_root,
           lease_owner_daemon_state_root, lease_owner_daemon_bin,
           lease_owner_daemon_authority_rank,
           most_recent_inbound_conversation_id, account_label_scope, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET
           agent = excluded.agent,
           project = excluded.project,
           account_label_scope = excluded.account_label_scope,
           status = excluded.status
       `)
-            .run(rec.schema_version, rec.session_id, rec.agent, project, rec.created_at, rec.lease_holder_connection_id, rec.lease_acquired_at, rec.lease_released_at, rec.lease_owner_process_pid, rec.lease_owner_process_label, rec.lease_owner_process_registered_at, rec.lease_owner_daemon_discovery_root, rec.lease_owner_daemon_checkout_root, rec.lease_owner_daemon_state_root, rec.lease_owner_daemon_bin, rec.lease_owner_daemon_authority_rank, rec.most_recent_inbound_conversation_id, rec.account_label_scope ?? null, rec.status);
+            .run(rec.schema_version, rec.session_id, rec.agent, project, rec.created_at, rec.lease_holder_connection_id, rec.lease_acquired_at, rec.lease_released_at, rec.lease_owner_process_pid, rec.lease_owner_process_label, rec.lease_owner_process_registered_at, rec.lease_owner_process_start_time ?? null, rec.lease_owner_daemon_discovery_root, rec.lease_owner_daemon_checkout_root, rec.lease_owner_daemon_state_root, rec.lease_owner_daemon_bin, rec.lease_owner_daemon_authority_rank, rec.most_recent_inbound_conversation_id, rec.account_label_scope ?? null, rec.status);
     }
     async acquireSessionLease(session, connection_id, at, owner) {
+        const ownerPid = owner?.process_pid ?? null;
+        let ownerStartTime = owner?.process_start_time ?? null;
+        if (ownerPid != null && ownerStartTime == null) {
+            await prefetchProcessStartIdentity([ownerPid]);
+            ownerStartTime = readProcessStartEpochMs(ownerPid);
+        }
         try {
             const result = this.db
                 .prepare(`
@@ -531,6 +584,7 @@ export class SqliteStorage {
               lease_owner_process_pid = ?,
               lease_owner_process_label = ?,
               lease_owner_process_registered_at = ?,
+              lease_owner_process_start_time = ?,
               lease_owner_daemon_discovery_root = ?,
               lease_owner_daemon_checkout_root = ?,
               lease_owner_daemon_state_root = ?,
@@ -539,7 +593,7 @@ export class SqliteStorage {
           WHERE session_id = ?
             AND (lease_holder_connection_id IS NULL OR lease_holder_connection_id = ?)
         `)
-                .run(connection_id, at, owner?.process_pid ?? null, owner?.process_label ?? null, owner?.process_pid ? at : null, owner?.daemon?.discovery_root ?? null, owner?.daemon?.checkout_root ?? null, owner?.daemon?.state_root ?? null, owner?.daemon?.daemon_bin ?? null, owner?.daemon?.authority_rank ?? null, session, connection_id);
+                .run(connection_id, at, ownerPid, owner?.process_label ?? null, ownerPid ? at : null, ownerPid ? ownerStartTime : null, owner?.daemon?.discovery_root ?? null, owner?.daemon?.checkout_root ?? null, owner?.daemon?.state_root ?? null, owner?.daemon?.daemon_bin ?? null, owner?.daemon?.authority_rank ?? null, session, connection_id);
             return result.changes === 1;
         }
         catch (error) {
@@ -557,6 +611,7 @@ export class SqliteStorage {
             lease_owner_process_pid = NULL,
             lease_owner_process_label = NULL,
             lease_owner_process_registered_at = NULL,
+            lease_owner_process_start_time = NULL,
             lease_owner_daemon_discovery_root = NULL,
             lease_owner_daemon_checkout_root = NULL,
             lease_owner_daemon_state_root = NULL,
@@ -597,8 +652,12 @@ export class SqliteStorage {
             (lease_owner_process_registered_at IS NULL AND ? IS NULL)
             OR lease_owner_process_registered_at = ?
           )
+          AND (
+            (lease_owner_process_start_time IS NULL AND ? IS NULL)
+            OR lease_owner_process_start_time = ?
+          )
       `)
-            .run(at, session, observed.status, observed.lease_holder_connection_id, observed.lease_holder_connection_id, observed.lease_owner_process_pid, observed.lease_owner_process_pid, observed.lease_owner_process_registered_at, observed.lease_owner_process_registered_at);
+            .run(at, session, observed.status, observed.lease_holder_connection_id, observed.lease_holder_connection_id, observed.lease_owner_process_pid, observed.lease_owner_process_pid, observed.lease_owner_process_registered_at, observed.lease_owner_process_registered_at, observed.lease_owner_process_start_time, observed.lease_owner_process_start_time);
         return Number(result.changes ?? 0) > 0;
     }
     async getSession(session) {
@@ -643,6 +702,91 @@ export class SqliteStorage {
         WHERE session_id = ?
       `)
             .run(conversation_id, session);
+    }
+    async setSessionWakeTarget(session, identity, wake_strict) {
+        const sets = [];
+        const params = [];
+        if (identity !== undefined) {
+            sets.push("wake_identity_json = ?");
+            params.push(identity == null ? null : JSON.stringify(identity));
+        }
+        if (wake_strict !== undefined) {
+            sets.push("wake_strict = ?");
+            params.push(wake_strict);
+        }
+        if (sets.length === 0)
+            return;
+        params.push(session);
+        this.db
+            .prepare(`UPDATE sessions SET ${sets.join(", ")} WHERE session_id = ?`)
+            .run(...params);
+    }
+    async getWakeMode(project, agent) {
+        const canonical = project === "" ? "" : normalizeProjectPath(project);
+        const scoped = this.db
+            .prepare("SELECT mode FROM wake_preferences WHERE project = ? AND agent = ?")
+            .get(canonical, agent);
+        if (scoped?.mode === "auto" || scoped?.mode === "native") {
+            return scoped.mode;
+        }
+        const global = this.db
+            .prepare("SELECT mode FROM wake_preferences WHERE project = '' AND agent = ?")
+            .get(agent);
+        if (global?.mode === "auto" || global?.mode === "native") {
+            return global.mode;
+        }
+        return "auto";
+    }
+    async setWakeMode(project, agent, mode, updated_at) {
+        const canonical = project === "" ? "" : normalizeProjectPath(project);
+        this.db
+            .prepare(`
+        INSERT INTO wake_preferences (project, agent, mode, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(project, agent) DO UPDATE SET
+          mode = excluded.mode,
+          updated_at = excluded.updated_at
+      `)
+            .run(canonical, agent, mode, updated_at);
+    }
+    async clearWakeMode(project, agent) {
+        const canonical = project === "" ? "" : normalizeProjectPath(project);
+        this.db
+            .prepare("DELETE FROM wake_preferences WHERE project = ? AND agent = ?")
+            .run(canonical, agent);
+    }
+    async listWakeModes() {
+        const rows = this.db
+            .prepare("SELECT project, agent, mode, updated_at FROM wake_preferences ORDER BY project, agent")
+            .all();
+        return rows;
+    }
+    async insertSession(rec) {
+        const project = normalizeProjectPath(rec.project);
+        this.db
+            .prepare(`
+        INSERT INTO sessions (
+          schema_version, session_id, agent, project, created_at,
+          lease_holder_connection_id, lease_acquired_at, lease_released_at,
+          lease_owner_process_pid, lease_owner_process_label,
+          lease_owner_process_registered_at, lease_owner_process_start_time,
+          lease_owner_daemon_discovery_root, lease_owner_daemon_checkout_root,
+          lease_owner_daemon_state_root, lease_owner_daemon_bin,
+          lease_owner_daemon_authority_rank,
+          most_recent_inbound_conversation_id, account_label_scope, status,
+          wake_identity_json, wake_strict
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+            .run(rec.schema_version, rec.session_id, rec.agent, project, rec.created_at, rec.lease_holder_connection_id, rec.lease_acquired_at, rec.lease_released_at, rec.lease_owner_process_pid, rec.lease_owner_process_label, rec.lease_owner_process_registered_at, rec.lease_owner_process_start_time ?? null, rec.lease_owner_daemon_discovery_root, rec.lease_owner_daemon_checkout_root, rec.lease_owner_daemon_state_root, rec.lease_owner_daemon_bin, rec.lease_owner_daemon_authority_rank, rec.most_recent_inbound_conversation_id, rec.account_label_scope ?? null, rec.status, rec.wake_identity ? JSON.stringify(rec.wake_identity) : null, rec.wake_strict);
+    }
+    async reactivateSessionIfEnded(session) {
+        const result = this.db
+            .prepare(`
+        UPDATE sessions SET status = 'active'
+        WHERE session_id = ? AND status = 'ended'
+      `)
+            .run(session);
+        return Number(result.changes ?? 0) > 0;
     }
     async addAllowlistGlobal(rec) {
         this.db
@@ -736,6 +880,147 @@ export class SqliteStorage {
             stmt.run(key.conversation_id, key.message_id, key.comm, key.account);
         }
     }
+    async reserveCurlInboundReceipt(input) {
+        const existing = await this.getCurlInboundReceipt(input);
+        if (existing) {
+            if (existing.state === "accepted" && existing.expires_at <= input.reserved_at) {
+                this.db
+                    .prepare(`
+            DELETE FROM curl_inbound_receipts
+            WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+          `)
+                    .run(input.registration_id, input.sender_id, input.client_key);
+            }
+            else if (existing.request_hash !== input.request_hash) {
+                return { kind: "conflict" };
+            }
+            else if (existing.state === "accepted") {
+                return {
+                    kind: "replay",
+                    message_id: existing.message_id,
+                    conversation_id: existing.conversation_id,
+                };
+            }
+            else {
+                return {
+                    kind: "resume",
+                    message_id: existing.message_id,
+                    conversation_id: existing.conversation_id,
+                };
+            }
+        }
+        try {
+            this.db
+                .prepare(`
+          INSERT INTO curl_inbound_receipts (
+            registration_id, sender_id, client_key, request_hash, message_id,
+            conversation_id, state, reserved_at, accepted_at, expires_at,
+            transcript_recorded_at, audit_recorded_at, dispatch_recorded_at,
+            query_consumed_at, planned_query_id
+          ) VALUES (?, ?, ?, ?, ?, NULL, 'pending', ?, NULL, ?, NULL, NULL, NULL, NULL, NULL)
+        `)
+                .run(input.registration_id, input.sender_id, input.client_key, input.request_hash, input.message_id, input.reserved_at, input.expires_at);
+            return { kind: "reserved", message_id: input.message_id };
+        }
+        catch (error) {
+            if (!isSqliteUniqueViolation(error))
+                throw error;
+            return this.reserveCurlInboundReceipt(input);
+        }
+    }
+    async acceptCurlInboundReceipt(input) {
+        const result = this.db
+            .prepare(`
+        UPDATE curl_inbound_receipts
+        SET state = 'accepted',
+            conversation_id = ?,
+            accepted_at = ?
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+          AND state = 'pending'
+      `)
+            .run(input.conversation_id, input.accepted_at, input.registration_id, input.sender_id, input.client_key);
+        return (result.changes ?? 0) === 1;
+    }
+    async getCurlInboundReceipt(scope) {
+        const row = this.db
+            .prepare(`
+        SELECT * FROM curl_inbound_receipts
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `)
+            .get(scope.registration_id, scope.sender_id, scope.client_key);
+        return row ? this.curlInboundReceiptFromRow(row) : null;
+    }
+    async deleteExpiredCurlInboundReceipts(now) {
+        const result = this.db
+            .prepare("DELETE FROM curl_inbound_receipts WHERE state = 'accepted' AND expires_at <= ?")
+            .run(now);
+        return result.changes ?? 0;
+    }
+    async markCurlReceiptConversation(scope, conversation_id) {
+        this.db
+            .prepare(`
+        UPDATE curl_inbound_receipts
+        SET conversation_id = COALESCE(conversation_id, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `)
+            .run(conversation_id, scope.registration_id, scope.sender_id, scope.client_key);
+    }
+    async markCurlReceiptTranscript(scope, at) {
+        this.db
+            .prepare(`
+        UPDATE curl_inbound_receipts
+        SET transcript_recorded_at = COALESCE(transcript_recorded_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `)
+            .run(at, scope.registration_id, scope.sender_id, scope.client_key);
+    }
+    async markCurlReceiptAudit(scope, at) {
+        this.db
+            .prepare(`
+        UPDATE curl_inbound_receipts
+        SET audit_recorded_at = COALESCE(audit_recorded_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `)
+            .run(at, scope.registration_id, scope.sender_id, scope.client_key);
+    }
+    async markCurlReceiptDispatch(scope, at) {
+        this.db
+            .prepare(`
+        UPDATE curl_inbound_receipts
+        SET dispatch_recorded_at = COALESCE(dispatch_recorded_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `)
+            .run(at, scope.registration_id, scope.sender_id, scope.client_key);
+    }
+    async markCurlReceiptQueryConsumed(scope, at) {
+        this.db
+            .prepare(`
+        UPDATE curl_inbound_receipts
+        SET query_consumed_at = COALESCE(query_consumed_at, ?)
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+      `)
+            .run(at, scope.registration_id, scope.sender_id, scope.client_key);
+    }
+    async markCurlReceiptPlannedQuery(scope, query_id) {
+        this.db
+            .prepare(`
+        UPDATE curl_inbound_receipts
+        SET planned_query_id = ?
+        WHERE registration_id = ? AND sender_id = ? AND client_key = ?
+          AND planned_query_id IS NULL
+      `)
+            .run(query_id, scope.registration_id, scope.sender_id, scope.client_key);
+    }
+    async hasPendingInboundDelivery(key) {
+        const row = this.db
+            .prepare(`
+        SELECT 1 AS present FROM pending_inbound_deliveries
+        WHERE conversation_id = ? AND message_id = ? AND comm = ? AND account = ?
+        LIMIT 1
+      `)
+            .get(key.conversation_id, key.message_id, key.comm, key.account);
+        return row != null;
+    }
     async close() {
         this.db.close();
     }
@@ -771,6 +1056,7 @@ export class SqliteStorage {
             account_label: r.account_label,
             bot_user_id: r.bot_user_id,
             credentials_ref: r.credentials_ref,
+            activation: r.activation ?? "lazy",
             bot_username: r.bot_username ?? undefined,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -817,6 +1103,26 @@ export class SqliteStorage {
             options_json: r.options_json,
         };
     }
+    curlInboundReceiptFromRow(row) {
+        const r = row;
+        return {
+            registration_id: r.registration_id,
+            sender_id: r.sender_id,
+            client_key: r.client_key,
+            request_hash: r.request_hash,
+            message_id: r.message_id,
+            conversation_id: r.conversation_id ?? null,
+            state: r.state,
+            reserved_at: r.reserved_at,
+            accepted_at: r.accepted_at ?? null,
+            expires_at: r.expires_at,
+            transcript_recorded_at: r.transcript_recorded_at ?? null,
+            audit_recorded_at: r.audit_recorded_at ?? null,
+            dispatch_recorded_at: r.dispatch_recorded_at ?? null,
+            query_consumed_at: r.query_consumed_at ?? null,
+            planned_query_id: r.planned_query_id ?? null,
+        };
+    }
     pendingInboundDeliveryFromRow(row) {
         const r = row;
         return {
@@ -843,6 +1149,7 @@ export class SqliteStorage {
             lease_owner_process_pid: r.lease_owner_process_pid,
             lease_owner_process_label: r.lease_owner_process_label,
             lease_owner_process_registered_at: r.lease_owner_process_registered_at,
+            lease_owner_process_start_time: r.lease_owner_process_start_time,
             lease_owner_daemon_discovery_root: r.lease_owner_daemon_discovery_root,
             lease_owner_daemon_checkout_root: r.lease_owner_daemon_checkout_root,
             lease_owner_daemon_state_root: r.lease_owner_daemon_state_root,
@@ -851,8 +1158,19 @@ export class SqliteStorage {
             most_recent_inbound_conversation_id: r.most_recent_inbound_conversation_id,
             account_label_scope: r.account_label_scope ?? null,
             status: r.status,
+            wake_identity: parseHerdrIdentityJson(r.wake_identity_json),
+            wake_strict: r.wake_strict === "herdr" ? "herdr" : null,
         };
     }
+}
+function isSqliteUniqueViolation(error) {
+    if (error == null || typeof error !== "object")
+        return false;
+    const sqliteError = error;
+    return (sqliteError.code === "SQLITE_CONSTRAINT_UNIQUE" ||
+        sqliteError.code === "SQLITE_CONSTRAINT_PRIMARYKEY" ||
+        sqliteError.errcode === 2067 ||
+        sqliteError.errcode === 1555);
 }
 export async function openSqliteStorage(path) {
     return SqliteStorage.open(path);

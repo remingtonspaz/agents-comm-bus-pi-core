@@ -38,6 +38,13 @@ export declare const DEFAULT_IPC_RECENCY_MARGIN_MS = 30000;
  */
 export type AuthorityRank = "main-dev" | "production" | "worktree";
 export declare const AUTHORITY_RANK_ORDER: Record<AuthorityRank, number>;
+/** Agent-neutral optional metadata stamped onto a comm-resource lease (AGE-100). */
+export interface AgentLeaseProperties {
+    codex?: {
+        appServerUrl: string;
+        threadId: string;
+    };
+}
 export interface LeaseRecord {
     comm_id: string;
     resource_id: string;
@@ -50,6 +57,10 @@ export interface LeaseRecord {
     acquiredAt: number;
     renewedAt: number;
     lastIpcServedAt: number;
+    /** Optional per-agent wake/control metadata; omitted on legacy lease files. */
+    agentProperties?: AgentLeaseProperties;
+    /** Process creation epoch (ms); stamped at acquire/renew for AGE-102 liveness. */
+    process_start_time?: number;
 }
 export interface SelfIdentity {
     pid: number;
@@ -67,7 +78,7 @@ export type AcquireResult = {
     reason: AcquireDenyReason;
     holder: LeaseRecord;
 };
-export type AcquireDenyReason = "held-by-higher-rank" | "held-by-same-rank-fresh" | "guard-contended";
+export type AcquireDenyReason = "held-by-higher-rank" | "held-by-same-rank-fresh" | "not-eligible-for-scope" | "guard-contended";
 export type RenewResult = {
     ok: true;
     record: LeaseRecord;
@@ -76,6 +87,24 @@ export type RenewResult = {
     reason: "lost";
     holder: LeaseRecord | null;
 };
+/** Read-only snapshot of a comm-resource lease held by this daemon (AGE-100). */
+export type HeldCommLeaseLookupResult = {
+    ok: true;
+    comm_id: string;
+    resource_id: string;
+    agentProperties?: AgentLeaseProperties;
+} | {
+    ok: false;
+    reason: "missing-record" | "unreadable" | "not-held-by-self";
+};
+export type ReadHeldCommLease = (commId: string, resourceId: string) => Promise<HeldCommLeaseLookupResult>;
+export type PersistHeldCommLeaseAgentPropertiesResult = {
+    ok: true;
+} | {
+    ok: false;
+    reason: "not-held" | "guard-contended";
+};
+export type PersistHeldCommLeaseAgentProperties = (commId: string, resourceId: string, agentProperties: AgentLeaseProperties) => Promise<PersistHeldCommLeaseAgentPropertiesResult>;
 /**
  * FIXED, homedir-anchored lease path. Deliberately bypasses resolveStatePaths /
  * AGENTS_COMM_BUS_ROOT: the whole point is that every checkout and every state
@@ -110,6 +139,8 @@ export interface RankInference {
  */
 export declare function inferAuthorityRank(input: RankInferenceInput): RankInference;
 export interface DecisionInput {
+    commId: string;
+    resourceId: string;
     self: SelfIdentity;
     selfLastIpcServedAt: number;
     existing: LeaseRecord | null;
@@ -117,6 +148,8 @@ export interface DecisionInput {
     isPidAlive: (pid: number) => boolean;
     stalenessMs: number;
     ipcRecencyMarginMs: number;
+    /** AGE-101: injected discovery-root/project eligibility; default true. */
+    eligible?: boolean;
 }
 export type Decision = {
     take: true;
@@ -164,6 +197,13 @@ export interface CommLeaseArbiterOptions {
     ipcRecencyMarginMs?: number;
     /** Audit hook for loud reclaim/deny events. Best-effort; never throws. */
     onAudit?: (event: CommLeaseAuditEvent) => void;
+    /** AGE-102: native-only process-start stamp; null omits identity (tests inject). */
+    readProcessStartIdentity?: (pid: number) => number | null;
+    /**
+     * Test-only: invoked after persistAgentPropertiesIfHeld acquires the guard,
+     * before writing the lease record. Resolve the returned promise to release.
+     */
+    testPersistUnderGuard?: (leasePath: string) => Promise<void>;
 }
 export interface CommLeaseAuditEvent {
     kind: "comm_lease_acquired" | "comm_lease_reclaimed" | "comm_lease_denied" | "comm_lease_lost" | "comm_lease_released";
@@ -180,6 +220,8 @@ export declare class CommLeaseArbiter {
     private readonly stalenessMs;
     private readonly ipcRecencyMarginMs;
     private readonly onAudit?;
+    private readonly readProcessStartIdentity;
+    private readonly testPersistUnderGuard?;
     /**
      * Per-resource signature of the last `comm_lease_denied` we actually audited,
      * keyed by `${commId}:${resourceId}` → `${reason}:${holderPid}`. The slow
@@ -194,6 +236,8 @@ export declare class CommLeaseArbiter {
     private readonly lastDenyAudit;
     /** AGE-36: runtime-local inventory of leases this arbiter currently holds. */
     private readonly heldLeases;
+    /** Locally desired agent properties keyed by `${commId}:${resourceId}` (AGE-100). */
+    private readonly desiredAgentProperties;
     constructor(options: CommLeaseArbiterOptions);
     get authorityRank(): AuthorityRank;
     /** Count of `(comm, resource)` leases this arbiter currently owns. */
@@ -204,11 +248,34 @@ export declare class CommLeaseArbiter {
         resource_id: string;
     }>;
     /**
+     * Record daemon-local desired agent properties for a comm resource. The next
+     * acquire/renew/sync stamps them onto the lease when this arbiter holds it.
+     */
+    setDesiredAgentProperties(commId: string, resourceId: string, agentProperties: AgentLeaseProperties): void;
+    desiredAgentPropertiesFor(commId: string, resourceId: string): AgentLeaseProperties | undefined;
+    /**
+     * Re-write `agentProperties` on an already-held lease from the desired map.
+     * No-op when this arbiter does not currently hold the lease.
+     */
+    syncAgentProperties(commId: string, resourceId: string): Promise<void>;
+    /**
+     * Set desired agent properties and synchronously rewrite the self-held lock
+     * record under the guard. Never self-claims an unheld lock.
+     */
+    persistAgentPropertiesIfHeld(commId: string, resourceId: string, agentProperties: AgentLeaseProperties): Promise<PersistHeldCommLeaseAgentPropertiesResult>;
+    /**
+     * Read the on-disk comm-resource lease when this arbiter's pid is the holder.
+     * Does not acquire or mutate the lease.
+     */
+    readHeldCommLease(commId: string, resourceId: string): Promise<HeldCommLeaseLookupResult>;
+    /**
      * Attempt to acquire (or reclaim) the lease for `(commId, resourceId)`. Reads
      * the existing record under a guard lock, applies {@link decideContention},
      * and writes the self record on a take. Returns a discriminated result.
      */
-    tryAcquire(commId: string, resourceId: string): Promise<AcquireResult>;
+    tryAcquire(commId: string, resourceId: string, acquireOptions?: {
+        eligible?: boolean;
+    }): Promise<AcquireResult>;
     /**
      * Re-write `renewedAt` + `lastIpcServedAt` — but ONLY if the on-disk record's
      * pid is still self. If a higher/equal-rank daemon reclaimed the lease in the
@@ -221,6 +288,16 @@ export declare class CommLeaseArbiter {
     private leasePath;
     private leaseKey;
     private buildRecord;
+    /**
+     * Stamp native process-start identity only when the OS probe succeeds.
+     * Preserves an existing self-held stamp; never writes uptime fallback.
+     */
+    private processStartTimeForRecord;
+    /**
+     * Stamp agent properties from the locally desired map. A lease reclaimed from
+     * another holder must never inherit the prior holder's properties.
+     */
+    private agentPropertiesForRecord;
     private placeholderHolder;
     private readRecord;
     private writeRecord;
@@ -240,6 +317,8 @@ export interface WrapWithLeaseOptions {
     renewIntervalMs?: number;
     /** Slow re-acquire poll interval while denied (ms). */
     reacquireIntervalMs?: number;
+    /** AGE-101: live eligibility verdict before each acquire/re-acquire attempt. */
+    leaseEligible?: () => boolean | Promise<boolean>;
     /** Injected timer factory (tests). Defaults to setInterval/clearInterval. */
     setIntervalFn?: (fn: () => void, ms: number) => unknown;
     clearIntervalFn?: (handle: unknown) => void;
@@ -247,6 +326,11 @@ export interface WrapWithLeaseOptions {
     log?: (message: string) => void;
 }
 export declare const DEFAULT_RENEW_INTERVAL_MS = 10000;
+/**
+ * AGE-102: immediately retry lease acquisition for a dormant denied wrapper.
+ * Returns true when a registered wrapper was nudged.
+ */
+export declare function nudgeLeaseReacquire(commId: string, resourceId: string): boolean;
 /**
  * Wrap an adapter so the daemon only starts it once it holds the
  * `(comm, resource)` ownership lease. The bus and the inner adapter stay

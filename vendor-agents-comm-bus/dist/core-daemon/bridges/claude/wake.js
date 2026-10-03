@@ -5,6 +5,7 @@ import path from "node:path";
 import { normalizeProjectPath } from "../../project-path.js";
 import { parseAccountLabelScope, resolveSessionForConversation, serializeAccountLabelScope, } from "../../session-label-scope.js";
 import { createSessionOwnerLiveness, } from "../../runtime/session-owner-liveness.js";
+import { selectActiveSessionForInboundWake } from "../../runtime/wake-target-selection.js";
 export function hashProjectKey(projectPath) {
     let hash = 0x811c9dc5;
     for (let i = 0; i < projectPath.length; i += 1) {
@@ -36,38 +37,8 @@ export async function writeClaudeWakeTrigger(wakeDir, now = Date.now) {
     await mkdir(wakeDir, { recursive: true });
     await writeFile(path.join(wakeDir, "trigger-enter"), `${now()}\n`, "utf8");
 }
-// AGE-65: the wake "seed" is the inbound message typed into the Claude prompt
-// slot (so the auto-mode classifier sees real user intent instead of a bare ".").
-// It is DECORATED with the comm + sender ("<comm> message from <sender>: <body>")
-// so another agent's message (Codex/Pi) can't be misread as the user's. Newlines
-// are PRESERVED — the watcher types each as backslash+Enter for a real multi-line
-// TUI prompt — while other control chars are stripped and the whole is bounded.
-// The hook's [Daemon Inbound Messages] block stays the authoritative full-content
-// + routing channel; this seed is best-effort.
-export const WAKE_SEED_MAX_CHARS = 2000;
-// Normalize CRLF->LF, keep newlines (0x0A), strip other control chars, cap, trim.
-export function sanitizeWakeSeed(text) {
-    if (!text)
-        return "";
-    const normalized = text
-        .replace(/\r\n?/g, "\n")
-        .replace(/[\x00-\x09\x0B-\x1F\x7F]/g, "")
-        .trim();
-    return normalized.length > WAKE_SEED_MAX_CHARS
-        ? normalized.slice(0, WAKE_SEED_MAX_CHARS)
-        : normalized;
-}
-// Build the decorated, sanitized seed. The "<comm> message from <sender>:" prefix
-// attributes the message so a Codex/Pi message isn't misconstrued as the user's.
-// Returns "" when there's no text to seed (e.g. attachment-only) -> bare "." wake.
-export function buildWakeSeed(input) {
-    const body = (input.body ?? "").trim();
-    if (!body)
-        return "";
-    const comm = input.comm && input.comm.length > 0 ? input.comm : "message";
-    const sender = input.sender && input.sender.length > 0 ? input.sender : "unknown sender";
-    return sanitizeWakeSeed(`${comm} message from ${sender}: ${body}`);
-}
+export { WAKE_SEED_MAX_CHARS, buildWakeSeed, sanitizeWakeSeed, } from "../../runtime/wake-seed.js";
+import { buildWakeSeed } from "../../runtime/wake-seed.js";
 export async function writeClaudeWakeSeed(wakeDir, text) {
     await mkdir(wakeDir, { recursive: true });
     await writeFile(path.join(wakeDir, "wake-seed.txt"), text, "utf8");
@@ -150,13 +121,51 @@ export class ClaudeWakeRegistry {
         await writeClaudeWakeTrigger(registration.wakeDir, this.now);
         return true;
     }
+    registerFromSession(session) {
+        return this.register({
+            session: session.session_id,
+            project: session.project,
+            account_label_scope: session.account_label_scope,
+        });
+    }
+    async resolveRegistrationForInbound(conversation, _message) {
+        if (conversation.agent !== "claude")
+            return null;
+        if (!this.storage)
+            return null;
+        const session = await selectActiveSessionForInboundWake(this.storage, conversation.project, "claude", conversation, this.sessionOwnerIsLive);
+        if (!session)
+            return null;
+        const registration = this.getForSession(session.session_id) ?? this.registerFromSession(session);
+        return { registration, session };
+    }
     async wakeConversation(conversation, message) {
         if (conversation.agent !== "claude")
             return false;
-        const registration = this.latestForProject(conversation.project, conversation) ??
-            (await this.hydrateLatestForProject(conversation.project, conversation));
-        if (!registration)
+        if (!this.storage) {
+            const registration = this.latestForProject(conversation.project, conversation);
+            if (!registration)
+                return false;
+            const seed = buildWakeSeed({
+                comm: message?.chat.comm,
+                sender: message?.sender?.display_name ?? message?.sender?.id,
+                body: message?.text,
+            });
+            if (seed) {
+                try {
+                    await writeClaudeWakeSeed(registration.wakeDir, seed);
+                }
+                catch {
+                    /* best-effort */
+                }
+            }
+            await writeClaudeWakeTrigger(registration.wakeDir, this.now);
+            return true;
+        }
+        const session = await selectActiveSessionForInboundWake(this.storage, conversation.project, "claude", conversation, this.sessionOwnerIsLive);
+        if (!session)
             return false;
+        const registration = this.getForSession(session.session_id) ?? this.registerFromSession(session);
         // AGE-65: drop the decorated inbound text as a seed BEFORE the trigger so it
         // is in place when the watcher consumes the trigger. Best-effort: a seed
         // write failure must not block the wake itself.
@@ -185,36 +194,10 @@ export class ClaudeWakeRegistry {
     async hydrateLatestForProject(project, conversation) {
         if (!this.storage)
             return undefined;
-        const resolved = normalizeProjectPath(project);
-        const sessions = await this.storage.listSessions({
-            project: resolved,
-            agent: "claude",
-            status: "active",
-        });
-        if (sessions.length === 0)
+        const session = await selectActiveSessionForInboundWake(this.storage, project, "claude", conversation, this.sessionOwnerIsLive);
+        if (!session)
             return undefined;
-        const live = sessions.filter(this.sessionOwnerIsLive);
-        const pool = live.length > 0 ? live : sessions;
-        let match = conversation
-            ? resolveSessionForConversation(pool, conversation, (sess) => sess.session_id)
-            : pool[0];
-        if (conversation && !match) {
-            // Multiple legacy/unscoped rows are ambiguous by session id but share
-            // the exact same project-only wake directory. Reaching this branch also
-            // proves no labeled scope matched, so unrelated labeled rows must not
-            // veto the legacy fallback.
-            match = pool.find((session) => session.account_label_scope == null);
-            if (!match)
-                return undefined;
-        }
-        const latest = match;
-        if (!latest)
-            return undefined;
-        return this.register({
-            session: latest.session_id,
-            project: resolved,
-            account_label_scope: latest.account_label_scope,
-        });
+        return this.registerFromSession(session);
     }
     /**
      * On a miss in `writeResponseForSession`, look up the specific session

@@ -1,4 +1,5 @@
 import { classifySessionOwnerProcess, } from "./session-owner-liveness.js";
+import { reconcileLazyAdapterScopes } from "./scope-release-reconcile.js";
 /** Default periodic sweep interval — boot-only is insufficient for long-lived daemons. */
 export const DEFAULT_SESSION_END_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 export function sessionEndObservation(session) {
@@ -7,6 +8,7 @@ export function sessionEndObservation(session) {
         lease_holder_connection_id: session.lease_holder_connection_id,
         lease_owner_process_pid: session.lease_owner_process_pid,
         lease_owner_process_registered_at: session.lease_owner_process_registered_at,
+        lease_owner_process_start_time: session.lease_owner_process_start_time,
     };
 }
 /**
@@ -32,12 +34,20 @@ export async function runSessionEndSweep(input) {
         cas_lost: 0,
     };
     const livenessOptions = {
-        now: input.now,
-        isPidAlive: input.isPidAlive,
-        recencyMs: input.recencyMs,
+        now: input.now ?? input.ownerLivenessOptions?.now,
+        isPidAlive: input.isPidAlive ?? input.ownerLivenessOptions?.isPidAlive,
+        recencyMs: input.recencyMs ?? input.ownerLivenessOptions?.recencyMs,
+        readProcessStartEpochMs: input.ownerLivenessOptions?.readProcessStartEpochMs,
+        readProcStat: input.ownerLivenessOptions?.readProcStat,
+        readBootId: input.ownerLivenessOptions?.readBootId,
+        readProcUptime: input.ownerLivenessOptions?.readProcUptime,
+        readClockTicksPerSec: input.ownerLivenessOptions?.readClockTicksPerSec,
     };
     const at = (input.now ?? Date.now)();
     const sessions = await input.storage.listSessions({ status: "active" });
+    if (input.prefetchIdentities) {
+        await input.prefetchIdentities(sessions.flatMap(session => session.lease_owner_process_pid == null ? [] : [session.lease_owner_process_pid]));
+    }
     for (const session of sessions) {
         const ownerState = classifySessionOwnerProcess(session, livenessOptions);
         if (!shouldSweepEndSession(session, livenessOptions)) {
@@ -57,10 +67,24 @@ export async function runSessionEndSweep(input) {
         else
             counts.cas_lost += 1;
     }
+    if (input.sweepHold) {
+        await input.sweepHold();
+    }
     const log = input.log ?? (() => { });
     log(`agents-comm-bus: session end sweep: ended=${counts.ended} ` +
         `kept_live=${counts.kept_live} kept_stale=${counts.kept_stale} ` +
         `kept_no_owner_leased=${counts.kept_no_owner_leased} cas_lost=${counts.cas_lost}`);
+    if (input.reconcile) {
+        counts.reconcile = await reconcileLazyAdapterScopes({
+            ...input.reconcile,
+            now: input.now,
+            graceMs: input.reconcile.graceMs,
+        });
+        log(`agents-comm-bus: scope reconcile: zero_live=${counts.reconcile.scopes_zero_live} ` +
+            `released=${counts.reconcile.scopes_released} ` +
+            `adapters_removed=${counts.reconcile.adapters_removed} ` +
+            `active_scopes_pruned=${counts.reconcile.active_scopes_pruned}`);
+    }
     return counts;
 }
 export function startSessionEndSweep(options) {
@@ -80,17 +104,64 @@ export function startSessionEndSweep(options) {
         });
     const clearTimeoutFn = options.clearTimeoutFn ?? ((h) => clearTimeout(h));
     let sweepInFlight = false;
+    let pendingTick = false;
+    let stopped = false;
     let interval = null;
-    const tick = () => {
-        if (sweepInFlight)
+    let earlyReconcile = false;
+    const reconcileState = options.reconcileState ?? {
+        zeroLiveSince: new Map(),
+        graceTimers: new Map(),
+    };
+    if (!reconcileState.graceTimers) {
+        reconcileState.graceTimers = new Map();
+    }
+    const cancelGraceExpiry = (key) => {
+        const handle = reconcileState.graceTimers.get(key);
+        if (handle != null) {
+            clearTimeoutFn(handle);
+            reconcileState.graceTimers.delete(key);
+        }
+    };
+    const scheduleGraceExpiry = (key, delayMs) => {
+        if (stopped)
             return;
+        cancelGraceExpiry(key);
+        const handle = setTimeoutFn(() => {
+            if (stopped)
+                return;
+            reconcileState.graceTimers.delete(key);
+            tick();
+        }, delayMs);
+        reconcileState.graceTimers.set(key, handle);
+    };
+    const tick = () => {
+        if (stopped)
+            return;
+        if (sweepInFlight) {
+            pendingTick = true;
+            return;
+        }
         sweepInFlight = true;
+        const graceMs = earlyReconcile ? 0 : undefined;
+        earlyReconcile = false;
         void runSessionEndSweep({
             storage: options.storage,
+            prefetchIdentities: options.prefetchIdentities,
             now: options.now,
             isPidAlive: options.isPidAlive,
             recencyMs: options.recencyMs,
+            ownerLivenessOptions: options.ownerLivenessOptions,
+            sweepHold: options.sweepHold,
             log: options.log,
+            reconcile: options.reconcile != null
+                ? {
+                    ...options.reconcile,
+                    state: reconcileState,
+                    graceMs,
+                    scheduleGraceExpiry,
+                    cancelGraceExpiry,
+                }
+                : undefined,
         })
             .catch((error) => {
             const log = options.log ?? console.error;
@@ -99,20 +170,34 @@ export function startSessionEndSweep(options) {
         })
             .finally(() => {
             sweepInFlight = false;
+            if (!stopped && pendingTick) {
+                pendingTick = false;
+                tick();
+            }
         });
     };
     if (options.runOnStart !== false) {
         tick();
     }
     const initial = setTimeoutFn(() => {
+        if (stopped)
+            return;
         interval = setIntervalFn(tick, intervalMs);
     }, intervalMs);
     return {
         stop() {
+            stopped = true;
             clearTimeoutFn(initial);
             if (interval != null)
                 clearIntervalFn(interval);
             interval = null;
+            for (const key of reconcileState.graceTimers.keys()) {
+                cancelGraceExpiry(key);
+            }
+        },
+        requestEarlyReconcile() {
+            earlyReconcile = true;
+            tick();
         },
     };
 }

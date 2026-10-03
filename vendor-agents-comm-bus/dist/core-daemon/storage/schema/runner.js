@@ -121,6 +121,38 @@ export const sessionLabelScopeMigration = {
         await ctx.exec(sql);
     },
 };
+export const curlInboundIdempotencyMigration = {
+    version: 13,
+    description: "AGE-96: curl inbound idempotency receipts + acceptance progress",
+    async up(ctx) {
+        const sql = await readFile(join(schemaDir, "013_curl_inbound_idempotency.sql"), "utf8");
+        await ctx.exec(sql);
+    },
+};
+export const registrationActivationMigration = {
+    version: 14,
+    description: "AGE-97: account_registrations activation flag (lazy | eager)",
+    async up(ctx) {
+        const sql = await readFile(join(schemaDir, "014_registration_activation.sql"), "utf8");
+        await ctx.exec(sql);
+    },
+};
+export const sessionOwnerProcessStartTimeMigration = {
+    version: 15,
+    description: "AGE-101: process start epoch for pid+start-time owner liveness",
+    async up(ctx) {
+        const sql = await readFile(join(schemaDir, "015_session_owner_process_start_time.sql"), "utf8");
+        await ctx.exec(sql);
+    },
+};
+export const herdrWakeMigration = {
+    version: 16,
+    description: "AGE-110: herdr wake identity + wake mode preferences",
+    async up(ctx) {
+        const sql = await readFile(join(schemaDir, "016_herdr_wake.sql"), "utf8");
+        await ctx.exec(sql);
+    },
+};
 export async function runStorageMigrations(db) {
     await new SqliteMigrationRunner(db).apply([
         initialMigration,
@@ -135,6 +167,10 @@ export async function runStorageMigrations(db) {
         durablePendingInboundMigration,
         sessionDaemonOwnerMigration,
         sessionLabelScopeMigration,
+        curlInboundIdempotencyMigration,
+        registrationActivationMigration,
+        sessionOwnerProcessStartTimeMigration,
+        herdrWakeMigration,
     ]);
 }
 //# sourceMappingURL=runner.js.map

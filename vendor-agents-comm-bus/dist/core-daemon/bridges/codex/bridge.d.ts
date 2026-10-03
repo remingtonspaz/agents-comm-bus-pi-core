@@ -1,9 +1,11 @@
-import { type AccountId, type AgentId, type AuditStore, type CommAdapter, type CommId, type Conversation, type QueryId, type Storage } from "agents-comm-bus-core";
+import { type AccountId, type AgentId, type AuditStore, type CommAdapter, type CommId, type Conversation, type QueryId, type Session, type SessionId, type Storage } from "agents-comm-bus-core";
 import type { MessageBus } from "../../bus.js";
-import type { AgentBridge, AgentBridgeContext, AgentBridgeFactory, DaemonSelfIdentity, EnsureCommsForSession, RetirementBlockerSnapshot } from "../../runtime/agent-bridge.js";
+import type { AgentBridge, AgentBridgeContext, AgentBridgeFactory, DaemonSelfIdentity, EnsureCommsForSession, PersistHeldCommLeaseAgentProperties, ReadHeldCommLease, RetirementBlockerSnapshot } from "../../runtime/agent-bridge.js";
 import type { PendingInboundEntry } from "../../runtime/pending-inbound.js";
 import { CodexAgentAdapter, type CodexAgentAdapterOptions } from "./adapter.js";
 import { type SessionOwnerLiveness } from "../../runtime/session-owner-liveness.js";
+import { type HerdrClient, type HerdrIdentity } from "../../runtime/herdr.js";
+import { type EffectiveWakeStrategy } from "../../runtime/wake-strategy.js";
 export interface CodexBridgeOptions {
     storage: Storage;
     bus: MessageBus;
@@ -28,11 +30,26 @@ export interface CodexBridgeOptions {
     clearTimeoutFn?: (handle: unknown) => void;
     /** AGE-81: injectable durable-owner liveness for scoped sibling precedence. */
     sessionOwnerIsLive?: SessionOwnerLiveness;
+    /** AGE-100: on-disk comm-lock lookup for inbound wake target resolution. */
+    readHeldCommLease?: ReadHeldCommLease;
+    /** AGE-103: persist discovered wake targets onto a self-held comm lock. */
+    persistHeldCommLeaseAgentProperties?: PersistHeldCommLeaseAgentProperties;
+    /** AGE-103: loopback port scan range for cwd-probe fallback (default 4500..4600). */
+    codexPortRange?: {
+        min: number;
+        max: number;
+    };
+    codexProbeTimeoutMs?: number;
+    codexProbeConcurrency?: number;
+    requestScopeReconcile?: () => void;
+    /** AGE-110: injectable herdr client for tests. */
+    herdrClientFactory?: (identity: HerdrIdentity) => HerdrClient;
 }
 export interface RegisterCodexSessionResult {
     ok: boolean;
     reason?: string;
     capabilities?: CodexAgentAdapter["capabilities"];
+    wake_strategy?: EffectiveWakeStrategy;
 }
 export interface CodexOpenQueryResult {
     query_id: QueryId;
@@ -62,6 +79,10 @@ export declare class CodexBridge implements AgentBridge {
     private pendingManagedCleanups;
     private inFlightManagedCleanups;
     private readonly sessionOwnerIsLive;
+    private readonly appServerClientFactory;
+    /** AGE-103: single-flight cwd probe keyed by comm+bot+project. */
+    private readonly inFlightCwdProbes;
+    private readonly cwdProbeJoiners;
     constructor(options: CodexBridgeOptions);
     attach(comms: CommAdapter[]): void;
     attachComm(comm: CommAdapter): void;
@@ -69,6 +90,11 @@ export declare class CodexBridge implements AgentBridge {
     invalidateRegistrationCaches(): void;
     getRetirementBlockers(): RetirementBlockerSnapshot | null;
     onInboundConversation(conversation: Conversation): Promise<void>;
+    private wakeWithResolvedTarget;
+    private tryProbeFallbackWake;
+    private getOrCreateCwdProbe;
+    private auditProbePersistFailure;
+    private auditProbeTargetValidationFailure;
     handleIpcMethod(method: string, params: Record<string, unknown>, ctx: {
         socket?: {
             once(event: "close", handler: () => void): void;
@@ -84,10 +110,23 @@ export declare class CodexBridge implements AgentBridge {
     private handleCommCallback;
     private waitForResolution;
     private clearWaiter;
+    private resolveInboundWakeTargetFromCommLock;
+    private auditInboundWakeTargetFailure;
+    private applyRegistrationTargets;
     private ensureCommsBestEffort;
+    /** AGE-91: daemon-local route = a tracked app-server route for this session. */
+    routeReady(sessionId: SessionId): boolean;
+    private isLocallyDeliverable;
+    /**
+     * AGE-90: after a deliverability edge with confirmed rehydration, wake once
+     * via the newest in-scope pending row. `pendingInboundForConversation`
+     * aggregates every owned-account entry in the project for one steer attempt.
+     */
+    private redrivePendingInbound;
     private trackSession;
     private untrackSession;
     private resolveSessionForConversation;
+    onHerdrPaneRegistered(session: Session): void;
     private releaseSessionLease;
     private ensureOwnerCheckTimer;
     private stopOwnerCheckTimerIfIdle;
@@ -97,6 +136,7 @@ export declare class CodexBridge implements AgentBridge {
     private cleanupManagedAppServerIfLeaseIsIdle;
     private chatRefForConversation;
     private auditWake;
+    private auditWakeFailure;
     private pendingInboundForConversation;
     /**
      * Cache the set of `${comm}:${bot_user_id}` keys this agent owns. See
@@ -105,8 +145,18 @@ export declare class CodexBridge implements AgentBridge {
     private ownedAccountKeys;
     private removePendingInbound;
 }
+export interface CodexBridgeFactoryOptions {
+    codexPortRange?: {
+        min: number;
+        max: number;
+    };
+    codexProbeTimeoutMs?: number;
+    codexProbeConcurrency?: number;
+}
 export declare class CodexBridgeFactory implements AgentBridgeFactory {
+    private readonly factoryOptions;
     readonly agentId: AgentId;
+    constructor(factoryOptions?: CodexBridgeFactoryOptions);
     create(context: AgentBridgeContext): AgentBridge;
 }
 //# sourceMappingURL=bridge.d.ts.map

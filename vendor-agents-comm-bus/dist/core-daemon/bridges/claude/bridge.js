@@ -12,8 +12,10 @@ import crypto from "node:crypto";
 import { SCHEMA_VERSION_SESSION, } from "agents-comm-bus-core";
 import { sessionLeaseOwnerWithDaemon } from "../../runtime/agent-bridge.js";
 import { normalizeProjectPath } from "../../project-path.js";
-import { accountLabelScopeFromParams, filterRegistrationsForSession, } from "../../session-label-scope.js";
+import { accountLabelScopeFromParams, filterRegistrationsForSession, sessionOwnsConversation, } from "../../session-label-scope.js";
 import { removePendingInboundEntries } from "../../runtime/durable-inbound.js";
+import { isSessionLocallyDeliverable } from "../../runtime/session-deliverability.js";
+import { applyHerdrWakeTargetFromRegisterParams, herdrRespond, herdrWake, validateHerdrRegisterParams, wakeSeedFromMessage, wakeStrategyForSession, } from "../../runtime/wake-strategy.js";
 import { ClaudeWakeRegistry } from "./wake.js";
 import { ClaudeOpenQueryTracker } from "./open-query-tracker.js";
 import { createSessionOwnerLiveness, } from "../../runtime/session-owner-liveness.js";
@@ -67,6 +69,18 @@ export class ClaudeBridge {
                 if (!payload)
                     return;
                 try {
+                    const sessionRecord = await this.options.storage.getSession(query.session);
+                    if (sessionRecord) {
+                        const herdr = await herdrRespond(sessionRecord, payload, {
+                            storage: this.options.storage,
+                            audit: this.options.audit,
+                            clientFactory: this.options.herdrClientFactory,
+                        });
+                        if (herdr.ok)
+                            return;
+                        if (herdr.strict)
+                            return;
+                    }
                     const delivered = await this.wake.writeResponseForSession(query.session, payload);
                     if (!delivered) {
                         await this.auditWakeFailure({
@@ -116,10 +130,34 @@ export class ClaudeBridge {
     invalidateRegistrationCaches() {
         this.ownedAccountsCache = null;
     }
+    onHerdrPaneRegistered(session) {
+        this.wake.registerFromSession(session);
+    }
     async onInboundConversation(conversation, message) {
         if (conversation.agent !== this.agentId)
             return;
         try {
+            const target = await this.wake.resolveRegistrationForInbound(conversation, message);
+            if (target) {
+                const strategy = await wakeStrategyForSession(this.options.storage, target.session);
+                if (strategy === "herdr") {
+                    const seed = wakeSeedFromMessage({
+                        comm: message?.chat.comm,
+                        sender: message?.sender?.display_name ?? message?.sender?.id,
+                        body: message?.text,
+                    });
+                    const herdr = await herdrWake(target.session, seed, {
+                        storage: this.options.storage,
+                        audit: this.options.audit,
+                        clientFactory: this.options.herdrClientFactory,
+                        conversationId: conversation.conversation_id,
+                    });
+                    if (herdr.ok)
+                        return;
+                    if (herdr.strict)
+                        return;
+                }
+            }
             const delivered = await this.wake.wakeConversation(conversation, message);
             if (!delivered) {
                 await this.auditWakeFailure({
@@ -196,15 +234,63 @@ export class ClaudeBridge {
      * as a follow-up.
      */
     async ensureCommsBestEffort(project, accountLabelScope) {
+        const hook = this.options.ensureCommsForSession;
+        if (!hook)
+            return false;
         try {
-            await this.options.ensureCommsForSession?.(project, this.agentId, {
+            const result = await hook(project, this.agentId, {
                 accountLabelScope: accountLabelScope ?? null,
             });
+            return result.rehydrated;
         }
         catch (error) {
             console.error(`agents-comm-bus: ensureCommsForSession failed for ${project}/${this.agentId}: ` +
                 `${error instanceof Error ? error.message : String(error)}`);
+            return false;
         }
+    }
+    /** AGE-91: daemon-local route = a registered wake dir for this session. */
+    routeReady(session) {
+        return this.wake.getForSession(session) !== undefined;
+    }
+    isLocallyDeliverable(session) {
+        return isSessionLocallyDeliverable(session, this.routeReady(session.session_id), this.sessionOwnerIsLive);
+    }
+    /**
+     * AGE-89: after a deliverability edge with confirmed rehydration, wake once
+     * for the newest in-scope pending row. The agent drain consumes the queue;
+     * the daemon must never remove pendingInbound here (AGE-64).
+     */
+    async redrivePendingInboundCoalesced(sessionId) {
+        const sess = await this.options.storage.getSession(sessionId);
+        if (!sess)
+            return;
+        const [registrations, sessions] = await Promise.all([
+            this.options.storage.listAccountRegistrations({
+                project: sess.project,
+                agent: this.agentId,
+            }),
+            this.options.storage.listSessions({
+                project: sess.project,
+                agent: this.agentId,
+                status: "active",
+            }),
+        ]);
+        const scopedRegs = filterRegistrationsForSession(registrations, sess, sessions, this.sessionOwnerIsLive);
+        const ownedKeys = new Set(scopedRegs.map((reg) => `${reg.comm}:${reg.bot_user_id}`));
+        const inScope = this.options.pendingInbound.filter((entry) => {
+            if (entry.conversation.project !== sess.project)
+                return false;
+            if (entry.conversation.agent !== this.agentId)
+                return false;
+            if (!ownedKeys.has(accountKey(entry)))
+                return false;
+            return sessionOwnsConversation(sess, sessions, entry.conversation, this.sessionOwnerIsLive);
+        });
+        if (inScope.length === 0)
+            return;
+        const seed = inScope.reduce((latest, entry) => entry.message.received_at > latest.message.received_at ? entry : latest);
+        await this.onInboundConversation(seed.conversation, seed.message);
     }
     async ownedAccountKeys(session) {
         // AGE-38: scope to the calling session's (project, agent), not agent-wide.
@@ -240,6 +326,10 @@ export class ClaudeBridge {
         return this.ownedAccountsCache;
     }
     async registerSession(params, socket) {
+        const herdrParams = validateHerdrRegisterParams(params, this.agentId);
+        if (!herdrParams.ok) {
+            return { ok: false, reason: herdrParams.reason };
+        }
         const session = requiredString(params.session, "session");
         const project = normalizeProjectPath(requiredString(params.project, "project"));
         const connectionId = typeof params.connection_id === "string"
@@ -264,6 +354,7 @@ export class ClaudeBridge {
             lease_owner_process_pid: null,
             lease_owner_process_label: null,
             lease_owner_process_registered_at: null,
+            lease_owner_process_start_time: null,
             lease_owner_daemon_discovery_root: null,
             lease_owner_daemon_checkout_root: null,
             lease_owner_daemon_state_root: null,
@@ -272,9 +363,16 @@ export class ClaudeBridge {
             most_recent_inbound_conversation_id: null,
             account_label_scope: accountLabelScope,
             status: "active",
+            wake_identity: null,
+            wake_strict: null,
         });
+        await applyHerdrWakeTargetFromRegisterParams(this.options.storage, session, params, this.agentId, this.sessionOwnerIsLive);
+        const baselineSession = await this.options.storage.getSession(session);
+        const deliverabilityBaseline = baselineSession
+            ? this.isLocallyDeliverable(baselineSession)
+            : false;
         const acquired = await this.options.storage.acquireSessionLease(session, connectionId, now, this.options.daemonOwner
-            ? sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams(params), this.options.daemonOwner)
+            ? await sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams(params), this.options.daemonOwner)
             : sessionLeaseOwnerFromParams(params));
         if (!acquired) {
             await this.ensureCommsBestEffort(project, accountLabelScope);
@@ -290,8 +388,19 @@ export class ClaudeBridge {
             void this.options.storage.releaseSessionConnectionLeasePreservingOwner(session, connectionId, Date.now());
         });
         // AGE-38/AGE-45: after wake registration + close handler so inbound cannot race ahead.
-        await this.ensureCommsBestEffort(project, accountLabelScope);
-        return { ok: true, wake_dir: registration.wakeDir };
+        const rehydrated = await this.ensureCommsBestEffort(project, accountLabelScope);
+        const afterSession = await this.options.storage.getSession(session);
+        const deliverabilityAfter = afterSession
+            ? this.isLocallyDeliverable(afterSession)
+            : false;
+        if (!deliverabilityBaseline && deliverabilityAfter && rehydrated) {
+            await this.redrivePendingInboundCoalesced(session);
+        }
+        const afterWake = await this.options.storage.getSession(session);
+        const wake_strategy = afterWake
+            ? await wakeStrategyForSession(this.options.storage, afterWake)
+            : "native";
+        return { ok: true, wake_dir: registration.wakeDir, wake_strategy };
     }
     async drainInbound(params) {
         const session = typeof params.session === "string" ? params.session : undefined;
@@ -798,11 +907,13 @@ function sessionLeaseOwnerFromParams(params) {
     const pid = numberParam(params.owner_process_pid);
     if (!pid)
         return undefined;
+    const startTime = numberParam(params.owner_process_start_time);
     return {
         process_pid: pid,
         process_label: typeof params.owner_process_label === "string"
             ? params.owner_process_label
             : "claude",
+        process_start_time: startTime,
     };
 }
 function numberParam(value) {

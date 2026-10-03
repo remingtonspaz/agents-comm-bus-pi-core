@@ -85,9 +85,19 @@ export declare class MessageBus {
     start(): Promise<void>;
     stop(): Promise<void>;
     receiveInbound(message: Message): Promise<Conversation>;
+    /**
+     * AGE-96: crash-resumable inbound path for curl POSTs that carry an
+     * idempotency scope. Progress markers live on the scoped curl receipt —
+     * the default receiveInbound path above is unchanged for all other comms.
+     */
+    private receiveInboundForCurlIdempotency;
+    private transcriptInboundTimestamp;
+    private assertCurlIdempotencyScope;
+    private auditHasInboundReceived;
     send(request: SendRequest): Promise<MessageId>;
     openQuery(query: Query): Promise<void>;
     private tryResolveOpenQuery;
+    private resolveQueryForCurlRecovery;
     /**
      * AGE-9: a bare reply matched more than one open query — never guess which
      * one was meant. Tell the user how to disambiguate (buttons are precise;
@@ -118,6 +128,14 @@ export declare class MessageBus {
      * `targetFromSession`, and `origin_chat` is built by `chatRefForConversation`
      * (which returns `bot_user_id`). A label reaching here now fails loud.
      */
+    /**
+     * AGE-95: best-effort audit of a pre-adapter routing failure. NEVER throws —
+     * an audit-append failure must not mask the original routing error
+     * (rethrow-literal, same discipline as AGE-93). Context is progressive:
+     * request comm/session/requested account always; resolved target when known;
+     * registration identity only after it resolves. No payload content.
+     */
+    private auditRoutingFailure;
     private registrationFor;
     private upsertConversation;
     private targetFromSession;

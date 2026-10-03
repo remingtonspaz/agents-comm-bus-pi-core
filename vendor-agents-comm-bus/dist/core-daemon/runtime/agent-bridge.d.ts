@@ -1,6 +1,9 @@
-import type { AccountId, AgentId, AuditStore, CommAdapter, CommId, Conversation, Message, Storage } from "agents-comm-bus-core";
+import type { AccountId, AgentId, AuditStore, CommAdapter, CommId, Conversation, Message, Session, SessionId, Storage } from "agents-comm-bus-core";
 import type { SessionLeaseOwner } from "agents-comm-bus-core/storage/storage";
 import type { MessageBus } from "../bus.js";
+import { readProcessStartEpochMs, prefetchProcessStartIdentity } from "./process-start-epoch.js";
+import type { AgentLeaseProperties, PersistHeldCommLeaseAgentProperties, ReadHeldCommLease } from "./comm-lease.js";
+export type { AgentLeaseProperties, HeldCommLeaseLookupResult, PersistHeldCommLeaseAgentProperties, PersistHeldCommLeaseAgentPropertiesResult, ReadHeldCommLease, } from "./comm-lease.js";
 import type { PendingInboundEntry } from "./pending-inbound.js";
 import type { SessionOwnerLiveness } from "./session-owner-liveness.js";
 /** Daemon-local retirement blockers: stable reason key → count (AGE-36). */
@@ -8,6 +11,66 @@ export type RetirementBlockerSnapshot = Readonly<Record<string, number>>;
 export type EnsureCommsForSessionOptions = {
     /** Canonical serialized account_label_scope JSON, or null when unscoped. */
     accountLabelScope?: string | null;
+    /** Optional agent metadata to stamp onto comm-resource leases (AGE-100). */
+    agentLeaseProperties?: AgentLeaseProperties;
+};
+/** Outcome of the daemon ensure-comms path (AGE-89 rehydration signal). */
+export type EnsureCommsForSessionResult = {
+    /** True when durable pending-inbound rehydration completed for this scope. */
+    rehydrated: boolean;
+    /** AGE-97: per-registration outcomes from the ensure loop (empty when none attempted). */
+    outcomes: EnsureRegistrationResult[];
+};
+export type EnsureRegistrationRetryClass = "permanent" | "transient" | "success";
+export type EnsureRegistrationResult = {
+    status: "started";
+    registration_id: string;
+    comm: CommId;
+    account_id: string;
+    retryClass: "success";
+} | {
+    status: "already-live";
+    registration_id: string;
+    comm: CommId;
+    account_id: string;
+    retryClass: "success";
+} | {
+    status: "in-flight";
+    registration_id: string;
+    comm: CommId;
+    account_id: string;
+    retryClass: "success";
+} | {
+    status: "no-factory";
+    registration_id: string;
+    comm: CommId;
+    account_id: string;
+    rescanned: boolean;
+    retryClass: "permanent";
+    reason: string;
+} | {
+    status: "invalid-credentials";
+    registration_id: string;
+    comm: CommId;
+    account_id: string;
+    reason: string;
+    retryClass: "permanent";
+    resolution: import("./credential-resolution.js").CredentialResolution;
+} | {
+    status: "construction-failed";
+    registration_id: string;
+    comm: CommId;
+    account_id: string;
+    reason: string;
+    retryClass: "transient";
+} | {
+    status: "start-failed";
+    registration_id: string;
+    comm: CommId;
+    account_id: string;
+    reason: string;
+    retryClass: "transient";
+    resolution: import("./credential-resolution.js").CredentialResolution;
 };
 /**
  * Lazily bring up the comm adapters a `(project, agent)` session needs, on
@@ -16,7 +79,7 @@ export type EnsureCommsForSessionOptions = {
  * the daemon instantiates (and leases) only the bots its live sessions use.
  * Idempotent — safe to call on every register (hooks register frequently).
  */
-export type EnsureCommsForSession = (project: string, agent: AgentId, options?: EnsureCommsForSessionOptions) => Promise<void>;
+export type EnsureCommsForSession = (project: string, agent: AgentId, options?: EnsureCommsForSessionOptions) => Promise<EnsureCommsForSessionResult>;
 /** Resolved daemon self-identity; stamped onto sessions at lease acquire (AGE-58). */
 export interface DaemonSelfIdentity {
     discoveryRoot: string;
@@ -36,6 +99,12 @@ export interface AgentBridgeContext {
     daemonOwner: DaemonSelfIdentity;
     /** AGE-81: live connection or recent, still-running durable owner process. */
     sessionOwnerIsLive: SessionOwnerLiveness;
+    /** AGE-100: read the on-disk comm lock when held by this daemon. */
+    readHeldCommLease: ReadHeldCommLease;
+    /** AGE-103: persist agent properties onto a self-held comm lock. */
+    persistHeldCommLeaseAgentProperties: PersistHeldCommLeaseAgentProperties;
+    /** AGE-101: hint explicit session exit for early lazy-scope reconcile. */
+    requestScopeReconcile?: () => void;
 }
 export interface AgentBridge {
     /** Agent id this bridge handles (e.g. `"claude"`). */
@@ -71,13 +140,36 @@ export interface AgentBridge {
      */
     invalidateRegistrationCaches?(): void;
     /**
+     * AGE-91: is there a daemon-local delivery route for this session?
+     *
+     * This is the per-host half of deliverability — the daemon composes it with
+     * the canonical owner-liveness predicate. It reports only whether THIS daemon
+     * holds a route object for the session; whether the far end answers is a wake
+     * outcome, not a deliverability fact.
+     *
+     * Bridges whose delivery is pull-based (the agent polls) have no route object
+     * and are route-ready by construction once registered.
+     */
+    routeReady?(session: SessionId): boolean;
+    /**
      * Optional: notification that a fresh inbound conversation just landed.
      * Bridges can use this to wake the agent (e.g. ClaudeBridge writes a
      * `trigger-enter` file). `message` is the inbound message that triggered
      * the dispatch — ClaudeBridge uses its text as the verbatim wake seed
      * (AGE-65). Optional so existing bridges can ignore it.
+     *
+     * AGE-94: the daemon guarantees `conversation.agent === this.agentId` at call
+     * time — the dispatch loop applies a central ownership default-deny before
+     * invoking this hook, so a bridge is never handed a foreign-agent
+     * conversation here. There is no additive all-inbound bridge observer today:
+     * the daemon owns the single dispatch sink (`setDispatchSink` REPLACES, it
+     * does not fan out), so a bridge must not reach for it. Cross-agent
+     * observation is separate design work. The bridge-local guard is kept as
+     * defense-in-depth, not because the contract permits foreign delivery.
      */
     onInboundConversation?(conversation: Conversation, message?: Message): Promise<void>;
+    /** Optional: herdr pane registered in storage (plugin IPC) — refresh bridge caches. */
+    onHerdrPaneRegistered?(session: Session): void;
     /** Handle an IPC method that this bridge advertised in `ipcMethods`. */
     handleIpcMethod(method: string, params: Record<string, unknown>, ctx: {
         socket?: {
@@ -98,5 +190,9 @@ export interface AgentBridgeFactory {
 export declare function sessionLeaseOwnerWithDaemon(ownerFromParams: {
     process_pid: number | null;
     process_label?: string | null;
-} | undefined, daemonOwner: DaemonSelfIdentity): SessionLeaseOwner;
+    process_start_time?: number | null;
+} | undefined, daemonOwner: DaemonSelfIdentity, identity?: {
+    prefetch: typeof prefetchProcessStartIdentity;
+    read: typeof readProcessStartEpochMs;
+}): Promise<SessionLeaseOwner>;
 //# sourceMappingURL=agent-bridge.d.ts.map

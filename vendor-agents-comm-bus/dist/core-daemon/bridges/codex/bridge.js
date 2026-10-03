@@ -1,14 +1,24 @@
 import crypto from "node:crypto";
 import { SCHEMA_VERSION_SESSION, } from "agents-comm-bus-core";
 import { normalizeProjectPath } from "../../project-path.js";
-import { accountLabelScopeFromParams, filterRegistrationsForSession, resolveSessionForConversation, } from "../../session-label-scope.js";
+import { accountLabelScopeFromParams, filterRegistrationsForSession, sessionOwnsConversation, } from "../../session-label-scope.js";
+import { isSessionLocallyDeliverable } from "../../runtime/session-deliverability.js";
 import { removePendingInboundEntries } from "../../runtime/durable-inbound.js";
 import { sessionLeaseOwnerWithDaemon } from "../../runtime/agent-bridge.js";
-import { CodexAgentAdapter, codexDecisionFromResolution, codexHookDecision, } from "./adapter.js";
+import { CodexAgentAdapter, codexDecisionFromResolution, codexHookDecision, isCodexWakeTargetValidationFailure, } from "./adapter.js";
+import { WebSocketCodexAppServerClient, } from "./app-server.js";
 import { cleanupManagedCodexAppServer } from "./app-server-lifecycle.js";
+import { probeCodexWakeTargetByCwd } from "./wake-target-probe.js";
 import { sessionEndObservation } from "../../runtime/session-end-sweep.js";
 import { createSessionOwnerLiveness, } from "../../runtime/session-owner-liveness.js";
+import { herdrSessionId, parseHerdrIdentity, } from "../../runtime/herdr.js";
+import { applyHerdrWakeTargetFromRegisterParams, effectiveWakeStrategy, herdrWake, parseWakeStrict, resolveWakeMode, validateHerdrRegisterParams, wakeSeedFromMessage, wakeStrategyForSession, } from "../../runtime/wake-strategy.js";
+import { selectActiveSessionForInboundWake, sessionLeaseHeld, } from "../../runtime/wake-target-selection.js";
 const DEFAULT_TTL_SECONDS = 3600;
+const DEFAULT_CODEX_PROBE_PORT_MIN = 4500;
+const DEFAULT_CODEX_PROBE_PORT_MAX = 4600;
+const DEFAULT_CODEX_PROBE_TIMEOUT_MS = 300;
+const DEFAULT_CODEX_PROBE_CONCURRENCY = 10;
 const DEFAULT_QUERY_POLL_TIMEOUT_MS = 9 * 60 * 1000;
 const DEFAULT_APP_SERVER_CLEANUP_DELAY_MS = 3_000;
 const DEFAULT_SESSION_OWNER_CHECK_INTERVAL_MS = 10_000;
@@ -33,13 +43,19 @@ export class CodexBridge {
     pendingManagedCleanups = 0;
     inFlightManagedCleanups = 0;
     sessionOwnerIsLive;
+    appServerClientFactory;
+    /** AGE-103: single-flight cwd probe keyed by comm+bot+project. */
+    inFlightCwdProbes = new Map();
+    cwdProbeJoiners = new Map();
     constructor(options) {
         this.options = options;
         this.sessionOwnerIsLive =
             options.sessionOwnerIsLive ?? createSessionOwnerLiveness();
+        this.appServerClientFactory =
+            options.appServerClientFactory ?? ((url) => new WebSocketCodexAppServerClient(url));
         this.adapter = new CodexAgentAdapter({
             defaultAppServerUrl: options.defaultAppServerUrl ?? process.env.CODEX_APP_SERVER_URL,
-            appServerClientFactory: options.appServerClientFactory,
+            appServerClientFactory: this.appServerClientFactory,
         });
     }
     attach(comms) {
@@ -92,17 +108,60 @@ export class CodexBridge {
         const pendingForSession = await this.pendingInboundForConversation(conversation, session);
         const mostRecentConversationId = pendingForSession.at(-1)?.conversation.conversation_id ?? conversation.conversation_id;
         await this.options.storage.setSessionMostRecentInbound(session, mostRecentConversationId);
+        const sessionRecord = await this.options.storage.getSession(session);
+        if (sessionRecord) {
+            const strategy = await wakeStrategyForSession(this.options.storage, sessionRecord);
+            if (strategy === "herdr") {
+                const latest = pendingForSession.at(-1);
+                const seed = latest
+                    ? wakeSeedFromMessage({
+                        comm: latest.message.chat.comm,
+                        sender: latest.message.sender?.display_name ?? latest.message.sender?.id,
+                        body: latest.message.text,
+                    })
+                    : wakeSeedFromMessage({
+                        comm: conversation.comm,
+                        body: "",
+                    });
+                const herdr = await herdrWake(sessionRecord, seed, {
+                    storage: this.options.storage,
+                    audit: this.options.audit,
+                    clientFactory: this.options.herdrClientFactory,
+                    conversationId: conversation.conversation_id,
+                });
+                if (herdr.ok)
+                    return;
+                if (herdr.strict)
+                    return;
+            }
+        }
+        const wakeTarget = await this.resolveInboundWakeTargetFromCommLock(conversation);
+        if (!wakeTarget.ok) {
+            if (wakeTarget.reason === "comm_lease_missing_codex_target") {
+                await this.tryProbeFallbackWake(conversation, session, pendingForSession, normalizeProjectPath(conversation.project));
+                return;
+            }
+            await this.auditInboundWakeTargetFailure(conversation, session, wakeTarget.reason, pendingForSession.length);
+            return;
+        }
+        await this.wakeWithResolvedTarget(conversation, session, pendingForSession, wakeTarget.project, wakeTarget.appServerUrl, wakeTarget.threadId, "comm_lease");
+    }
+    async wakeWithResolvedTarget(conversation, session, pendingForSession, project, appServerUrl, threadId, wakeTargetSource, probeDetail = {}) {
+        this.applyRegistrationTargets(session, project, appServerUrl, threadId);
         await this.auditWake("agent_wake_attempt", conversation, session, {
-            app_server_url: this.adapter.appServerUrlFor(session),
+            app_server_url: appServerUrl,
+            thread_id: threadId,
+            wake_target_source: wakeTargetSource,
             pending_count: pendingForSession.length,
             pending_message_ids: pendingForSession.map((entry) => entry.message.message_id),
             pending_conversation_ids: [...new Set(pendingForSession.map((entry) => entry.conversation.conversation_id))],
+            ...probeDetail,
         });
         try {
             const result = await this.adapter.wakeOrSteer(session, formatInboundMessagesForTurn(pendingForSession));
             if (result.ok) {
                 await this.auditWake("agent_wake_succeeded", conversation, session, {
-                    app_server_url: this.adapter.appServerUrlFor(session),
+                    app_server_url: appServerUrl,
                     method: result.method,
                     thread_id: result.threadId,
                     fallback_reason: result.fallbackFrom?.reason,
@@ -112,17 +171,134 @@ export class CodexBridge {
                     removed_pending_count: pendingForSession.length,
                 });
                 await this.removePendingInbound(session, pendingForSession);
+                return;
             }
+            if (isCodexWakeTargetValidationFailure(result.reason)) {
+                if (wakeTargetSource === "cwd_probe") {
+                    await this.auditProbeTargetValidationFailure(conversation, session, result.reason, pendingForSession.length);
+                    return;
+                }
+                await this.tryProbeFallbackWake(conversation, session, pendingForSession, project);
+                return;
+            }
+            await this.auditWakeFailure(conversation, session, result, pendingForSession.length);
         }
         catch (error) {
             await this.auditWake("agent_wake_failed", conversation, session, {
-                app_server_url: this.adapter.appServerUrlFor(session),
+                app_server_url: appServerUrl,
                 pending_count: pendingForSession.length,
                 error: error instanceof Error ? error.message : String(error),
             });
             console.error(`agents-comm-bus: failed to wake Codex for ${conversation.conversation_id}: ` +
                 `${error instanceof Error ? error.message : String(error)}`);
         }
+    }
+    async tryProbeFallbackWake(conversation, session, pendingForSession, project) {
+        if (!conversation.bot_user_id) {
+            await this.auditInboundWakeTargetFailure(conversation, session, "missing_bot_user_id", pendingForSession.length);
+            return;
+        }
+        const probeKey = `${conversation.comm}:${conversation.bot_user_id}:${project}`;
+        this.cwdProbeJoiners.set(probeKey, (this.cwdProbeJoiners.get(probeKey) ?? 0) + 1);
+        let probePromise;
+        try {
+            probePromise = this.getOrCreateCwdProbe(probeKey, project);
+            const probe = await probePromise;
+            if (!probe.ok) {
+                const detail = {
+                    reason: probe.reason,
+                    repair_required: true,
+                    pending_count: pendingForSession.length,
+                    probe_scanned: probe.scanned,
+                    probe_matches: probe.matches,
+                    probe_ports: probe.ports,
+                    comm: conversation.comm,
+                    bot_user_id: conversation.bot_user_id,
+                };
+                await this.auditWake("agent_wake_failed", conversation, session, detail);
+                await this.auditWake("agent_wake_target_invalid", conversation, session, detail);
+                console.error(`agents-comm-bus: inbound Codex cwd probe failed for ${conversation.conversation_id}: ${probe.reason}`);
+                return;
+            }
+            const persist = this.options.persistHeldCommLeaseAgentProperties;
+            if (!persist) {
+                await this.auditProbePersistFailure(conversation, session, pendingForSession.length, "unavailable");
+                return;
+            }
+            const leaseProps = codexAgentLeaseProperties(probe.appServerUrl, probe.threadId);
+            if (!leaseProps) {
+                await this.auditProbePersistFailure(conversation, session, pendingForSession.length, "invalid-probe-result");
+                return;
+            }
+            const persisted = await persist(conversation.comm, conversation.bot_user_id, leaseProps);
+            if (!persisted.ok) {
+                await this.auditProbePersistFailure(conversation, session, pendingForSession.length, persisted.reason);
+                return;
+            }
+            const probePort = Number(new URL(probe.appServerUrl).port);
+            await this.wakeWithResolvedTarget(conversation, session, pendingForSession, project, probe.appServerUrl, probe.threadId, "cwd_probe", {
+                probe_scanned: probe.scanned,
+                probe_port: probePort,
+            });
+        }
+        finally {
+            const remaining = (this.cwdProbeJoiners.get(probeKey) ?? 1) - 1;
+            if (remaining <= 0) {
+                this.cwdProbeJoiners.delete(probeKey);
+                queueMicrotask(() => {
+                    if ((this.cwdProbeJoiners.get(probeKey) ?? 0) === 0
+                        && probePromise
+                        && this.inFlightCwdProbes.get(probeKey) === probePromise) {
+                        this.inFlightCwdProbes.delete(probeKey);
+                    }
+                });
+            }
+            else {
+                this.cwdProbeJoiners.set(probeKey, remaining);
+            }
+        }
+    }
+    getOrCreateCwdProbe(key, project) {
+        let probe = this.inFlightCwdProbes.get(key);
+        if (probe)
+            return probe;
+        const portRange = this.options.codexPortRange ?? {
+            min: DEFAULT_CODEX_PROBE_PORT_MIN,
+            max: DEFAULT_CODEX_PROBE_PORT_MAX,
+        };
+        probe = probeCodexWakeTargetByCwd({
+            project,
+            portRange,
+            clientFactory: this.appServerClientFactory,
+            perProbeTimeoutMs: this.options.codexProbeTimeoutMs ?? DEFAULT_CODEX_PROBE_TIMEOUT_MS,
+            concurrency: this.options.codexProbeConcurrency ?? DEFAULT_CODEX_PROBE_CONCURRENCY,
+        });
+        this.inFlightCwdProbes.set(key, probe);
+        return probe;
+    }
+    async auditProbePersistFailure(conversation, session, pendingCount, reason) {
+        const detail = {
+            reason: `probe_persist_failed:${reason}`,
+            repair_required: true,
+            pending_count: pendingCount,
+            comm: conversation.comm,
+            bot_user_id: conversation.bot_user_id ?? undefined,
+        };
+        await this.auditWake("agent_wake_failed", conversation, session, detail);
+        await this.auditWake("agent_wake_target_invalid", conversation, session, detail);
+        console.error(`agents-comm-bus: inbound Codex probe persist failed for ${conversation.conversation_id}: ${reason}`);
+    }
+    async auditProbeTargetValidationFailure(conversation, session, reason, pendingCount) {
+        const detail = {
+            reason: `probe_target_validation_failed:${reason}`,
+            repair_required: true,
+            pending_count: pendingCount,
+            comm: conversation.comm,
+            bot_user_id: conversation.bot_user_id ?? undefined,
+        };
+        await this.auditWake("agent_wake_failed", conversation, session, detail);
+        await this.auditWake("agent_wake_target_invalid", conversation, session, detail);
+        console.error(`agents-comm-bus: inbound Codex probe target failed validation for ${conversation.conversation_id}: ${reason}`);
     }
     async handleIpcMethod(method, params, ctx) {
         switch (method) {
@@ -166,6 +342,7 @@ export class CodexBridge {
             lease_holder_connection_id: null,
             lease_owner_process_pid: null,
             lease_owner_process_registered_at: null,
+            lease_owner_process_start_time: null,
         }, sessions, this.sessionOwnerIsLive);
         const hasAppServerUrl = typeof params.app_server_url === "string" &&
             params.app_server_url.trim().length > 0;
@@ -175,21 +352,60 @@ export class CodexBridge {
             hasManagedSession &&
             params.app_server_reachable === true;
         const hasAccountRegistration = scopedRegistrations.length > 0;
-        const bootstrapRequired = hasAccountRegistration && !managedAppServerPresent;
+        let bootstrapRequired = hasAccountRegistration && !managedAppServerPresent;
+        let reason = !hasAccountRegistration
+            ? "no codex comm account registration for project"
+            : managedAppServerPresent
+                ? "codex session already has a reachable managed app-server url"
+                : "codex comm account registration exists but no managed app-server url is present";
+        const herdrIdentity = parseHerdrIdentity(params.herdr_identity);
+        if (herdrIdentity?.agent === this.agentId) {
+            const wakeStrict = parseWakeStrict(params.wake_strict);
+            const stored = (await this.options.storage.getSession(herdrSessionId(herdrIdentity))) ??
+                {
+                    schema_version: SCHEMA_VERSION_SESSION,
+                    session_id: herdrSessionId(herdrIdentity),
+                    agent: this.agentId,
+                    project,
+                    created_at: 0,
+                    lease_holder_connection_id: null,
+                    lease_acquired_at: null,
+                    lease_released_at: null,
+                    lease_owner_process_pid: null,
+                    lease_owner_process_label: null,
+                    lease_owner_process_registered_at: null,
+                    lease_owner_process_start_time: null,
+                    lease_owner_daemon_discovery_root: null,
+                    lease_owner_daemon_checkout_root: null,
+                    lease_owner_daemon_state_root: null,
+                    lease_owner_daemon_bin: null,
+                    lease_owner_daemon_authority_rank: null,
+                    most_recent_inbound_conversation_id: null,
+                    account_label_scope: accountLabelScope,
+                    status: "active",
+                    wake_identity: herdrIdentity,
+                    wake_strict: wakeStrict,
+                };
+            const mode = await resolveWakeMode(this.options.storage, project, this.agentId);
+            if (effectiveWakeStrategy(stored, mode) === "herdr") {
+                bootstrapRequired = false;
+                reason = "herdr";
+            }
+        }
         return {
             ok: true,
             has_account_registration: hasAccountRegistration,
             registration_count: scopedRegistrations.length,
             managed_app_server_present: managedAppServerPresent,
             bootstrap_required: bootstrapRequired,
-            reason: !hasAccountRegistration
-                ? "no codex comm account registration for project"
-                : managedAppServerPresent
-                    ? "codex session already has a reachable managed app-server url"
-                    : "codex comm account registration exists but no managed app-server url is present",
+            reason,
         };
     }
     async registerSession(params, socket) {
+        const herdrParams = validateHerdrRegisterParams(params, this.agentId);
+        if (!herdrParams.ok) {
+            return { ok: false, reason: herdrParams.reason };
+        }
         const session = requiredString(params.session, "session");
         const project = normalizeProjectPath(requiredString(params.project, "project"));
         const connectionId = typeof params.connection_id === "string"
@@ -209,6 +425,7 @@ export class CodexBridge {
             lease_owner_process_pid: null,
             lease_owner_process_label: null,
             lease_owner_process_registered_at: null,
+            lease_owner_process_start_time: null,
             lease_owner_daemon_discovery_root: null,
             lease_owner_daemon_checkout_root: null,
             lease_owner_daemon_state_root: null,
@@ -217,11 +434,18 @@ export class CodexBridge {
             most_recent_inbound_conversation_id: null,
             account_label_scope: accountLabelScope,
             status: "active",
+            wake_identity: null,
+            wake_strict: null,
         });
+        await applyHerdrWakeTargetFromRegisterParams(this.options.storage, session, params, this.agentId, this.sessionOwnerIsLive);
+        const baselineSession = await this.options.storage.getSession(session);
+        const deliverabilityBaseline = baselineSession
+            ? this.isLocallyDeliverable(baselineSession)
+            : false;
         const replaceExistingLease = params.replace_existing_lease === true ||
             params.persist_after_disconnect === true;
         const leaseOwner = this.options.daemonOwner
-            ? sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams(params, "codex"), this.options.daemonOwner)
+            ? await sessionLeaseOwnerWithDaemon(sessionLeaseOwnerFromParams(params, "codex"), this.options.daemonOwner)
             : sessionLeaseOwnerFromParams(params, "codex");
         let acquired = await this.options.storage.acquireSessionLease(session, connectionId, now, leaseOwner);
         if (!acquired) {
@@ -230,37 +454,52 @@ export class CodexBridge {
                 acquired = await this.options.storage.acquireSessionLease(session, connectionId, now, leaseOwner);
             }
         }
+        const appServerUrl = typeof params.app_server_url === "string"
+            ? params.app_server_url
+            : undefined;
+        const threadId = threadIdFromRegisterParams(params);
+        const agentLeaseProperties = this.applyRegistrationTargets(session, project, appServerUrl, threadId);
         if (!acquired) {
             const existing = await this.options.storage.getSession(session);
             if (existing?.lease_holder_connection_id && replaceExistingLease) {
                 await this.options.storage.releaseSessionLease(session, existing.lease_holder_connection_id, now);
                 const reacquired = await this.options.storage.acquireSessionLease(session, connectionId, now, leaseOwner);
                 if (!reacquired) {
-                    await this.ensureCommsBestEffort(project, accountLabelScope);
+                    await this.ensureCommsBestEffort(project, accountLabelScope, agentLeaseProperties);
                     return { ok: false, reason: "same-project codex session lease already held" };
                 }
             }
             else if (existing?.lease_holder_connection_id) {
-                await this.ensureCommsBestEffort(project, accountLabelScope);
+                await this.ensureCommsBestEffort(project, accountLabelScope, agentLeaseProperties);
+                const afterWake = await this.options.storage.getSession(session);
+                const wake_strategy = afterWake
+                    ? await wakeStrategyForSession(this.options.storage, afterWake)
+                    : "native";
                 return {
                     ok: true,
                     reason: "codex session lease already held; registration refreshed",
                     capabilities: this.adapter.capabilities,
+                    wake_strategy,
                 };
             }
             else {
-                await this.ensureCommsBestEffort(project, accountLabelScope);
+                await this.ensureCommsBestEffort(project, accountLabelScope, agentLeaseProperties);
                 return { ok: false, reason: "same-project codex session lease already held" };
             }
         }
         const control = new BridgeControlChannel();
         await this.adapter.connect(session, control);
-        if (typeof params.app_server_url === "string") {
-            this.adapter.setAppServerUrl(session, params.app_server_url);
-        }
+        this.applyRegistrationTargets(session, project, appServerUrl, threadId);
         this.trackSession(project, session, accountLabelScope);
         // AGE-38/AGE-45: after connect + trackSession so inbound cannot race ahead of setup.
-        await this.ensureCommsBestEffort(project, accountLabelScope);
+        const rehydrated = await this.ensureCommsBestEffort(project, accountLabelScope, agentLeaseProperties);
+        const afterSession = await this.options.storage.getSession(session);
+        const deliverabilityAfter = afterSession
+            ? this.isLocallyDeliverable(afterSession)
+            : false;
+        if (!deliverabilityBaseline && deliverabilityAfter && rehydrated) {
+            await this.redrivePendingInbound(session);
+        }
         const persistAfterDisconnect = params.persist_after_disconnect === true;
         const manageAppServerLifecycle = params.manage_app_server_lifecycle === true ||
             params.source === "mcp-server";
@@ -280,7 +519,11 @@ export class CodexBridge {
             void this.releaseSessionLease(lease);
         };
         socket?.once("close", release);
-        return { ok: true, capabilities: this.adapter.capabilities };
+        const afterWake = await this.options.storage.getSession(session);
+        const wake_strategy = afterWake
+            ? await wakeStrategyForSession(this.options.storage, afterWake)
+            : "native";
+        return { ok: true, capabilities: this.adapter.capabilities, wake_strategy };
     }
     async drainInbound(params) {
         const session = typeof params.session === "string" ? params.session : undefined;
@@ -375,8 +618,18 @@ export class CodexBridge {
     async turnControl(params) {
         const session = requiredString(params.session, "session");
         const kind = params.kind === "steer" ? "steer" : params.kind === "interrupt" ? "interrupt" : "start";
-        if (typeof params.app_server_url === "string") {
-            this.adapter.setAppServerUrl(session, params.app_server_url);
+        const appServerUrl = typeof params.app_server_url === "string" ? params.app_server_url : undefined;
+        const threadId = threadIdFromRegisterParams(params);
+        const route = this.sessionRoutes.get(session);
+        if (route && (appServerUrl || threadId)) {
+            this.adapter.setWakeTarget(session, {
+                project: route.project,
+                appServerUrl,
+                threadId,
+            });
+        }
+        if (appServerUrl) {
+            this.adapter.setAppServerUrl(session, appServerUrl);
         }
         if (kind === "start") {
             await this.adapter.wake(session);
@@ -450,16 +703,116 @@ export class CodexBridge {
     clearWaiter(queryId) {
         this.waiters.delete(queryId);
     }
-    async ensureCommsBestEffort(project, accountLabelScope) {
-        try {
-            await this.options.ensureCommsForSession?.(project, this.agentId, {
-                accountLabelScope: accountLabelScope ?? null,
+    async resolveInboundWakeTargetFromCommLock(conversation) {
+        if (!conversation.bot_user_id) {
+            return { ok: false, reason: "missing_bot_user_id" };
+        }
+        const readHeld = this.options.readHeldCommLease;
+        if (!readHeld) {
+            return { ok: false, reason: "comm_lease_lookup_unavailable" };
+        }
+        const lookup = await readHeld(conversation.comm, conversation.bot_user_id);
+        if (!lookup.ok) {
+            return { ok: false, reason: `comm_lease_${lookup.reason}` };
+        }
+        const codex = lookup.agentProperties?.codex;
+        const appServerUrl = codex?.appServerUrl;
+        const threadId = codex?.threadId;
+        if (typeof appServerUrl !== "string" || appServerUrl.length === 0
+            || typeof threadId !== "string" || threadId.length === 0) {
+            return { ok: false, reason: "comm_lease_missing_codex_target" };
+        }
+        return {
+            ok: true,
+            appServerUrl,
+            threadId,
+            project: normalizeProjectPath(conversation.project),
+        };
+    }
+    async auditInboundWakeTargetFailure(conversation, session, reason, pendingCount) {
+        const detail = {
+            reason,
+            repair_required: true,
+            pending_count: pendingCount,
+            comm: conversation.comm,
+            bot_user_id: conversation.bot_user_id ?? undefined,
+        };
+        await this.auditWake("agent_wake_failed", conversation, session, detail);
+        await this.auditWake("agent_wake_target_invalid", conversation, session, detail);
+        console.error(`agents-comm-bus: inbound Codex wake target invalid for ${conversation.conversation_id}: ${reason}`);
+    }
+    applyRegistrationTargets(session, project, appServerUrl, threadId) {
+        if (appServerUrl || threadId) {
+            this.adapter.setWakeTarget(session, {
+                project,
+                appServerUrl,
+                threadId,
             });
+        }
+        if (appServerUrl) {
+            this.adapter.setAppServerUrl(session, appServerUrl);
+        }
+        return codexAgentLeaseProperties(appServerUrl, threadId);
+    }
+    async ensureCommsBestEffort(project, accountLabelScope, agentLeaseProperties) {
+        const hook = this.options.ensureCommsForSession;
+        if (!hook)
+            return false;
+        try {
+            const result = await hook(project, this.agentId, {
+                accountLabelScope: accountLabelScope ?? null,
+                agentLeaseProperties,
+            });
+            return result.rehydrated;
         }
         catch (error) {
             console.error(`agents-comm-bus: ensureCommsForSession failed for ${project}/${this.agentId}: ` +
                 `${error instanceof Error ? error.message : String(error)}`);
+            return false;
         }
+    }
+    /** AGE-91: daemon-local route = a tracked app-server route for this session. */
+    routeReady(sessionId) {
+        return this.sessionRoutes.has(sessionId);
+    }
+    isLocallyDeliverable(session) {
+        return isSessionLocallyDeliverable(session, this.routeReady(session.session_id), this.sessionOwnerIsLive);
+    }
+    /**
+     * AGE-90: after a deliverability edge with confirmed rehydration, wake once
+     * via the newest in-scope pending row. `pendingInboundForConversation`
+     * aggregates every owned-account entry in the project for one steer attempt.
+     */
+    async redrivePendingInbound(sessionId) {
+        const sess = await this.options.storage.getSession(sessionId);
+        if (!sess)
+            return;
+        const [registrations, sessions] = await Promise.all([
+            this.options.storage.listAccountRegistrations({
+                project: sess.project,
+                agent: this.agentId,
+            }),
+            this.options.storage.listSessions({
+                project: sess.project,
+                agent: this.agentId,
+                status: "active",
+            }),
+        ]);
+        const scopedRegs = filterRegistrationsForSession(registrations, sess, sessions, this.sessionOwnerIsLive);
+        const ownedKeys = new Set(scopedRegs.map((reg) => `${reg.comm}:${reg.bot_user_id}`));
+        const inScope = this.options.pendingInbound.filter((entry) => {
+            if (entry.conversation.project !== sess.project)
+                return false;
+            if (entry.conversation.agent !== this.agentId)
+                return false;
+            if (!ownedKeys.has(accountKey(entry)))
+                return false;
+            return sessionOwnsConversation(sess, sessions, entry.conversation, this.sessionOwnerIsLive);
+        });
+        if (inScope.length === 0)
+            return;
+        const seed = inScope.reduce((latest, entry) => entry.message.received_at > latest.message.received_at ? entry : latest);
+        await this.onInboundConversation(seed.conversation);
     }
     trackSession(project, session, accountLabelScope) {
         this.sessionRoutes.set(session, {
@@ -475,29 +828,14 @@ export class CodexBridge {
     }
     async resolveSessionForConversation(conversation) {
         const project = normalizeProjectPath(conversation.project);
-        const inMemory = [...this.sessionRoutes.entries()]
-            .filter(([, route]) => route.project === project)
-            .map(([sessionId, route]) => ({
-            session_id: sessionId,
-            project: route.project,
-            agent: this.agentId,
-            account_label_scope: route.account_label_scope,
-        }));
-        const fromMemory = resolveSessionForConversation(inMemory, conversation, (sess) => sess.session_id);
-        if (fromMemory)
-            return fromMemory.session_id;
-        const sessions = await this.options.storage.listSessions({
-            project,
-            agent: this.agentId,
-            status: "active",
-        });
-        const live = sessions.filter((sess) => sess.lease_holder_connection_id != null);
-        const pool = live.length > 0 ? live : sessions;
-        const hydrated = resolveSessionForConversation(pool, conversation, (sess) => sess.session_id);
-        if (!hydrated)
+        const session = await selectActiveSessionForInboundWake(this.options.storage, project, this.agentId, conversation, sessionLeaseHeld);
+        if (!session)
             return undefined;
-        this.trackSession(project, hydrated.session_id, hydrated.account_label_scope);
-        return hydrated.session_id;
+        this.trackSession(project, session.session_id, session.account_label_scope);
+        return session.session_id;
+    }
+    onHerdrPaneRegistered(session) {
+        this.trackSession(normalizeProjectPath(session.project), session.session_id, session.account_label_scope);
     }
     async releaseSessionLease(input) {
         if (input.released)
@@ -608,6 +946,7 @@ export class CodexBridge {
                 return;
             }
             await this.options.storage.endSessionIfUnchanged(session, sessionEndObservation(latest), Date.now());
+            this.options.requestScopeReconcile?.();
         }
         catch (error) {
             console.error(`agents-comm-bus: failed to cleanup Codex app-server for ${session}: ` +
@@ -662,6 +1001,22 @@ export class CodexBridge {
             console.error(`agents-comm-bus: failed to audit Codex wake event for ${conversation.conversation_id}: ` +
                 `${error instanceof Error ? error.message : String(error)}`);
         }
+    }
+    async auditWakeFailure(conversation, session, result, pendingCount) {
+        const detail = {
+            app_server_url: this.adapter.appServerUrlFor(session),
+            pending_count: pendingCount,
+            reason: result.reason,
+            error: result.error,
+            thread_id: result.threadId,
+            repair_required: isCodexWakeTargetValidationFailure(result.reason),
+        };
+        await this.auditWake("agent_wake_failed", conversation, session, detail);
+        if (isCodexWakeTargetValidationFailure(result.reason)) {
+            await this.auditWake("agent_wake_target_invalid", conversation, session, detail);
+        }
+        console.error(`agents-comm-bus: failed to wake Codex for ${conversation.conversation_id}: ${result.reason}` +
+            `${result.error ? `: ${result.error}` : ""}`);
     }
     async pendingInboundForConversation(conversation, session) {
         const owned = await this.ownedAccountKeys(session);
@@ -822,6 +1177,27 @@ function ackTextFor(decision) {
             return "Recorded";
     }
 }
+function codexAgentLeaseProperties(appServerUrl, threadId) {
+    if (!appServerUrl || !threadId)
+        return undefined;
+    return {
+        codex: {
+            appServerUrl,
+            threadId,
+        },
+    };
+}
+function threadIdFromRegisterParams(params) {
+    const direct = params.thread_id ?? params.threadId;
+    if (typeof direct === "string" && direct.length > 0)
+        return direct;
+    const codex = recordOrEmpty(params.codex);
+    const fromHook = codex.thread_id ??
+        codex.threadId ??
+        codex.session_id ??
+        codex.sessionId;
+    return typeof fromHook === "string" && fromHook.length > 0 ? fromHook : undefined;
+}
 function requiredString(paramsValue, name) {
     if (typeof paramsValue !== "string" || paramsValue.length === 0) {
         throw new Error(`${name} is required`);
@@ -842,6 +1218,7 @@ function sessionLeaseOwnerFromParams(params, fallbackLabel) {
         process_label: typeof params.owner_process_label === "string"
             ? params.owner_process_label
             : fallbackLabel,
+        process_start_time: numberParam(params.owner_process_start_time),
     };
 }
 function numberParam(value) {
@@ -872,7 +1249,11 @@ class BridgeControlChannel {
     }
 }
 export class CodexBridgeFactory {
+    factoryOptions;
     agentId = "codex";
+    constructor(factoryOptions = {}) {
+        this.factoryOptions = factoryOptions;
+    }
     create(context) {
         return new CodexBridge({
             storage: context.storage,
@@ -882,6 +1263,12 @@ export class CodexBridgeFactory {
             ensureCommsForSession: context.ensureCommsForSession,
             daemonOwner: context.daemonOwner,
             sessionOwnerIsLive: context.sessionOwnerIsLive,
+            readHeldCommLease: context.readHeldCommLease,
+            persistHeldCommLeaseAgentProperties: context.persistHeldCommLeaseAgentProperties,
+            codexPortRange: this.factoryOptions.codexPortRange,
+            codexProbeTimeoutMs: this.factoryOptions.codexProbeTimeoutMs,
+            codexProbeConcurrency: this.factoryOptions.codexProbeConcurrency,
+            requestScopeReconcile: context.requestScopeReconcile,
         });
     }
 }

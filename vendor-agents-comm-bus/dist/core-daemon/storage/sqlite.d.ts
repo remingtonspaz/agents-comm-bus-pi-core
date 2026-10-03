@@ -1,6 +1,6 @@
 import type { ResolvedDecision } from "agents-comm-bus-core";
 import type { AccountRegistration, AllowlistGlobalEntry, AllowlistPerBotEntry, Conversation, QueryRecord, Session } from "agents-comm-bus-core/records";
-import type { AccountRelabelInput, AccountRelabelResult, AccountTokenUpdateInput, AccountTokenUpdateResult, PendingInboundDeliveryKey, PendingInboundDeliveryRow, SessionEndObservation, SessionLeaseOwner, Storage } from "agents-comm-bus-core/storage/storage";
+import type { AccountActivationUpdateInput, AccountActivationUpdateResult, AccountRelabelInput, AccountRelabelResult, AccountTokenUpdateInput, AccountTokenUpdateResult, CurlInboundReceipt, CurlInboundReceiptAcceptInput, CurlInboundReceiptReserveInput, CurlInboundReceiptReserveResult, CurlInboundReceiptScope, PendingInboundDeliveryKey, PendingInboundDeliveryRow, SessionEndObservation, SessionLeaseOwner, Storage } from "agents-comm-bus-core/storage/storage";
 import type { AgentId, CommId, ConversationId, MessageId, QueryId, SessionId } from "agents-comm-bus-core";
 import { type SqliteLike } from "./schema/runner.js";
 export declare class SqliteStorage implements Storage {
@@ -11,6 +11,7 @@ export declare class SqliteStorage implements Storage {
     static open(path: string): Promise<SqliteStorage>;
     putAccountRegistration(rec: AccountRegistration): Promise<void>;
     getAccountByBot(comm: CommId, bot_user_id: string): Promise<AccountRegistration | null>;
+    getAccountByRegistrationId(registration_id: string): Promise<AccountRegistration | null>;
     listAccountRegistrations(filter?: {
         project?: string;
         comm?: CommId;
@@ -19,6 +20,7 @@ export declare class SqliteStorage implements Storage {
     deleteAccountRegistration(project: string, comm: CommId, agent: AgentId, account_label: string): Promise<void>;
     updateAccountRegistrationToken(input: AccountTokenUpdateInput): Promise<AccountTokenUpdateResult>;
     updateAccountRegistrationLabel(input: AccountRelabelInput): Promise<AccountRelabelResult>;
+    updateAccountRegistrationActivation(input: AccountActivationUpdateInput): Promise<AccountActivationUpdateResult>;
     upsertConversation(rec: Conversation): Promise<ConversationId>;
     /**
      * Resolve an existing conversation's stable conversation_id by its immutable
@@ -72,6 +74,18 @@ export declare class SqliteStorage implements Storage {
         account_label_scope?: string | null;
     }): Promise<Session[]>;
     setSessionMostRecentInbound(session: SessionId, conversation_id: ConversationId): Promise<void>;
+    setSessionWakeTarget(session: SessionId, identity: Session["wake_identity"] | null | undefined, wake_strict: Session["wake_strict"] | null | undefined): Promise<void>;
+    getWakeMode(project: string, agent: AgentId): Promise<"auto" | "native">;
+    setWakeMode(project: string, agent: AgentId, mode: "auto" | "native", updated_at: number): Promise<void>;
+    clearWakeMode(project: string, agent: AgentId): Promise<void>;
+    listWakeModes(): Promise<Array<{
+        project: string;
+        agent: AgentId;
+        mode: "auto" | "native";
+        updated_at: number;
+    }>>;
+    insertSession(rec: Session): Promise<void>;
+    reactivateSessionIfEnded(session: SessionId): Promise<boolean>;
     addAllowlistGlobal(rec: AllowlistGlobalEntry): Promise<void>;
     removeAllowlistGlobal(comm: CommId, sender_id: string): Promise<void>;
     listAllowlistGlobal(filter?: {
@@ -89,12 +103,24 @@ export declare class SqliteStorage implements Storage {
         agent: AgentId;
     }): Promise<PendingInboundDeliveryRow[]>;
     acknowledgePendingInboundDeliveries(keys: PendingInboundDeliveryKey[]): Promise<void>;
+    reserveCurlInboundReceipt(input: CurlInboundReceiptReserveInput): Promise<CurlInboundReceiptReserveResult>;
+    acceptCurlInboundReceipt(input: CurlInboundReceiptAcceptInput): Promise<boolean>;
+    getCurlInboundReceipt(scope: CurlInboundReceiptScope): Promise<CurlInboundReceipt | null>;
+    deleteExpiredCurlInboundReceipts(now: number): Promise<number>;
+    markCurlReceiptConversation(scope: CurlInboundReceiptScope, conversation_id: ConversationId): Promise<void>;
+    markCurlReceiptTranscript(scope: CurlInboundReceiptScope, at: number): Promise<void>;
+    markCurlReceiptAudit(scope: CurlInboundReceiptScope, at: number): Promise<void>;
+    markCurlReceiptDispatch(scope: CurlInboundReceiptScope, at: number): Promise<void>;
+    markCurlReceiptQueryConsumed(scope: CurlInboundReceiptScope, at: number): Promise<void>;
+    markCurlReceiptPlannedQuery(scope: CurlInboundReceiptScope, query_id: QueryId): Promise<void>;
+    hasPendingInboundDelivery(key: PendingInboundDeliveryKey): Promise<boolean>;
     close(): Promise<void>;
     private allowlistGlobalFromRow;
     private allowlistPerBotFromRow;
     private accountFromRow;
     private conversationFromRow;
     private queryFromRow;
+    private curlInboundReceiptFromRow;
     private pendingInboundDeliveryFromRow;
     private sessionFromRow;
 }

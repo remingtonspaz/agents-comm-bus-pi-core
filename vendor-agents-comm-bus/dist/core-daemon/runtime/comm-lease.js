@@ -3,6 +3,7 @@ import { open, mkdir, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DAEMON_NAME } from "../config.js";
+import { readProcessStartIdentity } from "./process-start-epoch.js";
 /**
  * AGE-35: single-consumer comm-resource ownership lease.
  *
@@ -147,6 +148,13 @@ function defaultIsDirectory(p) {
  */
 export function decideContention(input) {
     const { self, existing, now, isPidAlive, stalenessMs } = input;
+    // AGE-101: foreign/missing discovery-root ownership blocks acquire even when
+    // rank would win — eligibility is computed outside this module and injected.
+    if (input.eligible === false) {
+        const holder = existing ??
+            ineligiblePlaceholderHolder(input.commId, input.resourceId);
+        return { take: false, reason: "not-eligible-for-scope", holder };
+    }
     // 1. No holder, dead holder, or stale holder → take.
     if (!existing)
         return { take: true, reason: "no-holder" };
@@ -173,6 +181,21 @@ export function decideContention(input) {
     }
     return { take: false, reason: "held-by-same-rank-fresh", holder: existing };
 }
+function ineligiblePlaceholderHolder(commId, resourceId) {
+    return {
+        comm_id: commId,
+        resource_id: resourceId,
+        pid: -1,
+        stateRoot: "",
+        checkoutRoot: null,
+        daemonBin: null,
+        daemonVersion: "",
+        authorityRank: "worktree",
+        acquiredAt: 0,
+        renewedAt: 0,
+        lastIpcServedAt: 0,
+    };
+}
 export class CommLeaseArbiter {
     self;
     lastIpcServedAt;
@@ -182,6 +205,8 @@ export class CommLeaseArbiter {
     stalenessMs;
     ipcRecencyMarginMs;
     onAudit;
+    readProcessStartIdentity;
+    testPersistUnderGuard;
     /**
      * Per-resource signature of the last `comm_lease_denied` we actually audited,
      * keyed by `${commId}:${resourceId}` → `${reason}:${holderPid}`. The slow
@@ -196,6 +221,8 @@ export class CommLeaseArbiter {
     lastDenyAudit = new Map();
     /** AGE-36: runtime-local inventory of leases this arbiter currently holds. */
     heldLeases = new Set();
+    /** Locally desired agent properties keyed by `${commId}:${resourceId}` (AGE-100). */
+    desiredAgentProperties = new Map();
     constructor(options) {
         this.self = options.self;
         this.lastIpcServedAt = options.lastIpcServedAt;
@@ -205,6 +232,8 @@ export class CommLeaseArbiter {
         this.stalenessMs = options.stalenessMs ?? DEFAULT_STALENESS_MS;
         this.ipcRecencyMarginMs = options.ipcRecencyMarginMs ?? DEFAULT_IPC_RECENCY_MARGIN_MS;
         this.onAudit = options.onAudit;
+        this.readProcessStartIdentity = options.readProcessStartIdentity ?? readProcessStartIdentity;
+        this.testPersistUnderGuard = options.testPersistUnderGuard;
     }
     get authorityRank() {
         return this.self.authorityRank;
@@ -224,11 +253,94 @@ export class CommLeaseArbiter {
         });
     }
     /**
+     * Record daemon-local desired agent properties for a comm resource. The next
+     * acquire/renew/sync stamps them onto the lease when this arbiter holds it.
+     */
+    setDesiredAgentProperties(commId, resourceId, agentProperties) {
+        this.desiredAgentProperties.set(this.leaseKey(commId, resourceId), agentProperties);
+    }
+    desiredAgentPropertiesFor(commId, resourceId) {
+        return this.desiredAgentProperties.get(this.leaseKey(commId, resourceId));
+    }
+    /**
+     * Re-write `agentProperties` on an already-held lease from the desired map.
+     * No-op when this arbiter does not currently hold the lease.
+     */
+    async syncAgentProperties(commId, resourceId) {
+        const desired = this.desiredAgentProperties.get(this.leaseKey(commId, resourceId));
+        if (!desired)
+            return;
+        await this.persistAgentPropertiesIfHeld(commId, resourceId, desired);
+    }
+    /**
+     * Set desired agent properties and synchronously rewrite the self-held lock
+     * record under the guard. Never self-claims an unheld lock.
+     */
+    async persistAgentPropertiesIfHeld(commId, resourceId, agentProperties) {
+        this.setDesiredAgentProperties(commId, resourceId, agentProperties);
+        const leasePath = this.leasePath(commId, resourceId);
+        const guard = await this.acquireGuard(leasePath);
+        if (!guard) {
+            return { ok: false, reason: "guard-contended" };
+        }
+        try {
+            const existing = await this.readRecord(leasePath);
+            if (!existing || existing.pid !== this.self.pid) {
+                return { ok: false, reason: "not-held" };
+            }
+            const updated = {
+                ...existing,
+                renewedAt: this.now(),
+                lastIpcServedAt: this.lastIpcServedAt(),
+                agentProperties,
+            };
+            if (this.testPersistUnderGuard) {
+                await this.testPersistUnderGuard(leasePath);
+            }
+            await this.writeRecord(leasePath, updated);
+            return { ok: true };
+        }
+        finally {
+            await this.releaseGuard(leasePath, guard);
+        }
+    }
+    /**
+     * Read the on-disk comm-resource lease when this arbiter's pid is the holder.
+     * Does not acquire or mutate the lease.
+     */
+    async readHeldCommLease(commId, resourceId) {
+        const key = this.leaseKey(commId, resourceId);
+        if (!this.heldLeases.has(key)) {
+            return { ok: false, reason: "not-held-by-self" };
+        }
+        const leasePath = this.leasePath(commId, resourceId);
+        let exists = false;
+        try {
+            exists = existsSync(leasePath);
+        }
+        catch {
+            return { ok: false, reason: "unreadable" };
+        }
+        if (!exists)
+            return { ok: false, reason: "missing-record" };
+        const existing = await this.readRecord(leasePath);
+        if (!existing)
+            return { ok: false, reason: "unreadable" };
+        if (existing.pid !== this.self.pid)
+            return { ok: false, reason: "not-held-by-self" };
+        return {
+            ok: true,
+            comm_id: commId,
+            resource_id: resourceId,
+            agentProperties: existing.agentProperties,
+        };
+    }
+    /**
      * Attempt to acquire (or reclaim) the lease for `(commId, resourceId)`. Reads
      * the existing record under a guard lock, applies {@link decideContention},
      * and writes the self record on a take. Returns a discriminated result.
      */
-    async tryAcquire(commId, resourceId) {
+    async tryAcquire(commId, resourceId, acquireOptions) {
         const leasePath = this.leasePath(commId, resourceId);
         const guard = await this.acquireGuard(leasePath);
         if (!guard) {
@@ -239,6 +351,8 @@ export class CommLeaseArbiter {
         try {
             const existing = await this.readRecord(leasePath);
             const decision = decideContention({
+                commId,
+                resourceId,
                 self: this.self,
                 selfLastIpcServedAt: this.lastIpcServedAt(),
                 existing,
@@ -246,6 +360,7 @@ export class CommLeaseArbiter {
                 isPidAlive: this.isPidAlive,
                 stalenessMs: this.stalenessMs,
                 ipcRecencyMarginMs: this.ipcRecencyMarginMs,
+                eligible: acquireOptions?.eligible,
             });
             if (!decision.take) {
                 // Dedup: only audit a denial on a state change (first denial of a streak,
@@ -335,6 +450,8 @@ export class CommLeaseArbiter {
                 ...existing,
                 renewedAt: this.now(),
                 lastIpcServedAt: this.lastIpcServedAt(),
+                process_start_time: this.processStartTimeForRecord(existing),
+                agentProperties: this.agentPropertiesForRecord(commId, resourceId, existing),
             };
             await this.writeRecord(leasePath, renewed);
             return { ok: true, record: renewed };
@@ -387,7 +504,32 @@ export class CommLeaseArbiter {
             acquiredAt: existing && existing.pid === this.self.pid ? existing.acquiredAt : now,
             renewedAt: now,
             lastIpcServedAt: this.lastIpcServedAt(),
+            process_start_time: this.processStartTimeForRecord(existing),
+            agentProperties: this.agentPropertiesForRecord(commId, resourceId, existing),
         };
+    }
+    /**
+     * Stamp native process-start identity only when the OS probe succeeds.
+     * Preserves an existing self-held stamp; never writes uptime fallback.
+     */
+    processStartTimeForRecord(existing) {
+        if (existing && existing.pid === this.self.pid && existing.process_start_time != null) {
+            return existing.process_start_time;
+        }
+        const identity = this.readProcessStartIdentity(this.self.pid);
+        return identity ?? undefined;
+    }
+    /**
+     * Stamp agent properties from the locally desired map. A lease reclaimed from
+     * another holder must never inherit the prior holder's properties.
+     */
+    agentPropertiesForRecord(commId, resourceId, existing) {
+        const desired = this.desiredAgentProperties.get(this.leaseKey(commId, resourceId));
+        if (desired)
+            return desired;
+        if (existing && existing.pid === this.self.pid)
+            return existing.agentProperties;
+        return undefined;
     }
     placeholderHolder(commId, resourceId) {
         // Synthetic record for the "guard contended and no readable record" edge —
@@ -464,8 +606,10 @@ export class CommLeaseArbiter {
             const pid = Number(raw.split(":")[0]);
             if (!Number.isInteger(pid) || pid <= 0)
                 return true;
-            if (pid === this.self.pid)
-                return true; // our own leftover guard
+            if (pid === this.self.pid) {
+                // Same-process guard may be held by the sweeper or an in-flight acquire.
+                return false;
+            }
             return !this.isPidAlive(pid);
         }
         catch {
@@ -527,6 +671,21 @@ function isAlreadyExistsError(error) {
 // from event-loop lag. See AGE-35 review (item 1).
 export const DEFAULT_RENEW_INTERVAL_MS = 10_000;
 const DEFAULT_REACQUIRE_INTERVAL_MS = 60_000;
+const leaseReacquireNudges = new Map();
+function leaseResourceKey(commId, resourceId) {
+    return `${commId}:${resourceId}`;
+}
+/**
+ * AGE-102: immediately retry lease acquisition for a dormant denied wrapper.
+ * Returns true when a registered wrapper was nudged.
+ */
+export function nudgeLeaseReacquire(commId, resourceId) {
+    const nudge = leaseReacquireNudges.get(leaseResourceKey(commId, resourceId));
+    if (!nudge)
+        return false;
+    nudge();
+    return true;
+}
 /**
  * Wrap an adapter so the daemon only starts it once it holds the
  * `(comm, resource)` ownership lease. The bus and the inner adapter stay
@@ -552,10 +711,25 @@ export function wrapWithLease(inner, arbiter, options = {}) {
         });
     const clearIntervalFn = options.clearIntervalFn ?? ((h) => clearInterval(h));
     const log = options.log ?? ((m) => console.error(m));
+    const leaseEligible = options.leaseEligible;
+    const isLeaseEligible = async () => {
+        if (!leaseEligible)
+            return true;
+        try {
+            return await leaseEligible();
+        }
+        catch {
+            return false;
+        }
+    };
     let renewTimer = null;
     let reacquireTimer = null;
     let innerStarted = false;
     let holdingLease = false;
+    let stopped = false;
+    let reacquireInFlight = false;
+    let pendingReacquire = false;
+    let reacquireTask = null;
     const resource = inner.exclusiveResource?.() ?? null;
     const clearTimers = () => {
         if (renewTimer != null) {
@@ -568,7 +742,7 @@ export function wrapWithLease(inner, arbiter, options = {}) {
         }
     };
     const startRenewTimer = (resourceId) => {
-        if (renewTimer != null)
+        if (stopped || renewTimer != null)
             return;
         renewTimer = setIntervalFn(() => {
             void arbiter
@@ -602,41 +776,114 @@ export function wrapWithLease(inner, arbiter, options = {}) {
         }, renewIntervalMs);
     };
     const startReacquireTimer = (resourceId) => {
-        if (reacquireTimer != null)
+        if (stopped || reacquireTimer != null)
             return;
         reacquireTimer = setIntervalFn(() => {
-            void arbiter
-                .tryAcquire(inner.id, resourceId)
-                .then(async (result) => {
-                if (!result.ok)
-                    return; // still denied; keep slow-polling
-                if (reacquireTimer != null) {
-                    clearIntervalFn(reacquireTimer);
-                    reacquireTimer = null;
-                }
-                holdingLease = true;
-                log(`comm ${inner.id} resource ${resourceId}: acquired the poll lease ` +
-                    `on re-acquire; starting this consumer.`);
-                try {
-                    await inner.start();
-                    innerStarted = true;
-                    startRenewTimer(resourceId);
-                }
-                catch (error) {
-                    innerStarted = false;
-                    holdingLease = false;
-                    log(`comm ${inner.id} resource ${resourceId}: inner.start() failed after ` +
-                        `re-acquire: ${error instanceof Error ? error.message : String(error)}; ` +
-                        `releasing lease.`);
-                    await arbiter.release(inner.id, resourceId).catch(() => { });
-                    startReacquireTimer(resourceId);
-                }
-            })
-                .catch(() => {
-                // Re-acquire error — keep slow-polling.
-            });
+            scheduleReacquireAttempt(resourceId);
         }, reacquireIntervalMs);
     };
+    const trackReacquireTask = (task) => {
+        reacquireTask = task;
+        void task.finally(() => {
+            if (reacquireTask === task)
+                reacquireTask = null;
+        });
+    };
+    const scheduleReacquireAttempt = (resourceId) => {
+        if (stopped || holdingLease || innerStarted)
+            return;
+        if (reacquireInFlight) {
+            pendingReacquire = true;
+            return;
+        }
+        trackReacquireTask(runReacquireAttempt(resourceId));
+    };
+    const runReacquireAttempt = async (resourceId) => {
+        if (stopped || holdingLease || innerStarted)
+            return;
+        if (reacquireInFlight) {
+            pendingReacquire = true;
+            return;
+        }
+        reacquireInFlight = true;
+        try {
+            const eligible = await isLeaseEligible();
+            if (stopped)
+                return;
+            const result = await arbiter.tryAcquire(inner.id, resourceId, { eligible });
+            if (stopped) {
+                if (result.ok)
+                    await arbiter.release(inner.id, resourceId).catch(() => { });
+                return;
+            }
+            if (!result.ok) {
+                startReacquireTimer(resourceId);
+                return;
+            }
+            if (reacquireTimer != null) {
+                clearIntervalFn(reacquireTimer);
+                reacquireTimer = null;
+            }
+            holdingLease = true;
+            if (stopped) {
+                holdingLease = false;
+                await arbiter.release(inner.id, resourceId).catch(() => { });
+                return;
+            }
+            log(`comm ${inner.id} resource ${resourceId}: acquired the poll lease ` +
+                `on re-acquire; starting this consumer.`);
+            try {
+                await inner.start();
+                if (stopped) {
+                    innerStarted = false;
+                    holdingLease = false;
+                    await inner.stop().catch(() => { });
+                    await arbiter.release(inner.id, resourceId).catch(() => { });
+                    return;
+                }
+                innerStarted = true;
+                startRenewTimer(resourceId);
+            }
+            catch (error) {
+                innerStarted = false;
+                holdingLease = false;
+                log(`comm ${inner.id} resource ${resourceId}: inner.start() failed after ` +
+                    `re-acquire: ${error instanceof Error ? error.message : String(error)}; ` +
+                    `releasing lease.`);
+                await arbiter.release(inner.id, resourceId).catch(() => { });
+                if (!stopped)
+                    startReacquireTimer(resourceId);
+            }
+        }
+        catch {
+            if (!stopped)
+                startReacquireTimer(resourceId);
+        }
+        finally {
+            reacquireInFlight = false;
+            if (!stopped && pendingReacquire && !holdingLease && !innerStarted) {
+                pendingReacquire = false;
+                scheduleReacquireAttempt(resourceId);
+            }
+            else {
+                pendingReacquire = false;
+            }
+        }
+    };
+    const nudgeReacquire = () => {
+        if (stopped || !resource)
+            return;
+        if (holdingLease || innerStarted)
+            return;
+        if (reacquireTimer != null) {
+            clearIntervalFn(reacquireTimer);
+            reacquireTimer = null;
+        }
+        scheduleReacquireAttempt(resource.resourceId);
+    };
+    if (resource) {
+        leaseReacquireNudges.set(leaseResourceKey(inner.id, resource.resourceId), nudgeReacquire);
+    }
     const proxy = {
         get id() {
             return inner.id;
@@ -657,7 +904,8 @@ export function wrapWithLease(inner, arbiter, options = {}) {
                 innerStarted = true;
                 return;
             }
-            const result = await arbiter.tryAcquire(inner.id, resource.resourceId);
+            const eligible = await isLeaseEligible();
+            const result = await arbiter.tryAcquire(inner.id, resource.resourceId, { eligible });
             if (!result.ok) {
                 holdingLease = false;
                 log(`comm ${inner.id} resource ${resource.resourceId}: another daemon owns the ` +
@@ -685,7 +933,14 @@ export function wrapWithLease(inner, arbiter, options = {}) {
             }
         },
         async stop() {
+            stopped = true;
             clearTimers();
+            if (resource) {
+                leaseReacquireNudges.delete(leaseResourceKey(inner.id, resource.resourceId));
+            }
+            if (reacquireTask) {
+                await reacquireTask.catch(() => { });
+            }
             try {
                 if (innerStarted)
                     await inner.stop();

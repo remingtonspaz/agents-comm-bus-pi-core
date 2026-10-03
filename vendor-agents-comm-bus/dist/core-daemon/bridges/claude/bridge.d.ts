@@ -8,10 +8,12 @@
  * `attach` to the bus + the running comm adapters; everything Claude-specific
  * stays inside this module.
  */
-import { type AuditStore, type AccountId, type AgentId, type CommAdapter, type CommId, type Conversation, type Message, type QueryId, type SessionId, type Storage } from "agents-comm-bus-core";
+import { type AuditStore, type AccountId, type AgentId, type CommAdapter, type CommId, type Conversation, type Message, type QueryId, type Session, type SessionId, type Storage } from "agents-comm-bus-core";
 import type { MessageBus } from "../../bus.js";
 import type { AgentBridge, AgentBridgeContext, AgentBridgeFactory, DaemonSelfIdentity, EnsureCommsForSession, RetirementBlockerSnapshot } from "../../runtime/agent-bridge.js";
 import type { PendingInboundEntry } from "../../runtime/pending-inbound.js";
+import { type EffectiveWakeStrategy } from "../../runtime/wake-strategy.js";
+import type { HerdrClient, HerdrIdentity } from "../../runtime/herdr.js";
 import { type SessionOwnerLiveness } from "../../runtime/session-owner-liveness.js";
 export type { PendingInboundEntry } from "../../runtime/pending-inbound.js";
 export interface ClaudeBridgeOptions {
@@ -40,6 +42,8 @@ export interface ClaudeBridgeOptions {
     clearTimeoutFn?: (handle: unknown) => void;
     /** AGE-81: injectable durable-owner liveness for scoped sibling precedence. */
     sessionOwnerIsLive?: SessionOwnerLiveness;
+    /** AGE-110: injectable herdr client for tests. */
+    herdrClientFactory?: (identity: HerdrIdentity) => HerdrClient;
 }
 /**
  * Outcome shape returned by claude_register_session.
@@ -48,6 +52,7 @@ export interface RegisterSessionResult {
     ok: boolean;
     reason?: string;
     wake_dir?: string;
+    wake_strategy?: EffectiveWakeStrategy;
 }
 /**
  * Outcome shape returned by claude_open_query.
@@ -81,6 +86,7 @@ export declare class ClaudeBridge implements AgentBridge {
     detachComm(_commId: CommId, _accountId: AccountId): void;
     getRetirementBlockers(): RetirementBlockerSnapshot | null;
     invalidateRegistrationCaches(): void;
+    onHerdrPaneRegistered(session: Session): void;
     onInboundConversation(conversation: Conversation, message?: Message): Promise<void>;
     private auditWakeFailure;
     handleIpcMethod(method: string, params: Record<string, unknown>, ctx: {
@@ -107,6 +113,15 @@ export declare class ClaudeBridge implements AgentBridge {
      * as a follow-up.
      */
     private ensureCommsBestEffort;
+    /** AGE-91: daemon-local route = a registered wake dir for this session. */
+    routeReady(session: SessionId): boolean;
+    private isLocallyDeliverable;
+    /**
+     * AGE-89: after a deliverability edge with confirmed rehydration, wake once
+     * for the newest in-scope pending row. The agent drain consumes the queue;
+     * the daemon must never remove pendingInbound here (AGE-64).
+     */
+    private redrivePendingInboundCoalesced;
     private ownedAccountKeys;
     registerSession(params: Record<string, unknown>, socket?: {
         once(event: "close", handler: () => void): void;

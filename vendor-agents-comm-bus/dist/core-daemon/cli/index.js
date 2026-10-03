@@ -5,6 +5,7 @@ import { accountList } from "./account-list.js";
 import { accountRelabel, } from "./account-relabel.js";
 import { accountRemove } from "./account-remove.js";
 import { accountUpdateToken, } from "./account-update-token.js";
+import { accountUpdateActivation, } from "./account-update-activation.js";
 import { allowlistAdd } from "./allowlist-add.js";
 import { allowlistImportFromEnv, allowlistImportFromFiles, } from "./allowlist-import.js";
 import { allowlistList } from "./allowlist-list.js";
@@ -13,6 +14,50 @@ import { parseMigrateArgs, runMigration } from "./migrate.js";
 import { reloadDaemonRegistrations } from "./reload-helper.js";
 import { redact } from "./redact.js";
 import { daemonStatus, formatDaemonStatus } from "./status.js";
+import { wakeModeClear, wakeModeGet, wakeModeList, wakeModeSet, } from "./wake-mode.js";
+import { herdrPaneRelease, herdrPaneSync } from "./herdr-pane.js";
+async function handleWakeModeCommand(rest) {
+    const [sub, ...tail] = rest;
+    const args = parseArgs(tail);
+    switch (sub) {
+        case "set": {
+            const mode = required(args.mode ?? tail.find((a) => !a.startsWith("--")), "mode");
+            if (mode !== "auto" && mode !== "native") {
+                throw new Error("wake-mode set requires mode auto|native");
+            }
+            const out = await wakeModeSet({
+                agent: required(args.agent, "--agent"),
+                project: args.project,
+                mode,
+            });
+            console.log(JSON.stringify(out, null, 2));
+            return;
+        }
+        case "get": {
+            const out = await wakeModeGet({
+                agent: required(args.agent, "--agent"),
+                project: args.project,
+            });
+            console.log(JSON.stringify(out, null, 2));
+            return;
+        }
+        case "clear": {
+            const out = await wakeModeClear({
+                agent: required(args.agent, "--agent"),
+                project: args.project,
+            });
+            console.log(JSON.stringify(out, null, 2));
+            return;
+        }
+        case "list": {
+            const out = await wakeModeList();
+            console.log(JSON.stringify(out, null, 2));
+            return;
+        }
+        default:
+            throw new Error(`unknown wake-mode subcommand: ${sub ?? "(none)"}`);
+    }
+}
 async function main() {
     const [command, ...rest] = process.argv.slice(2);
     const args = parseArgs(rest);
@@ -102,6 +147,24 @@ async function main() {
             console.log(JSON.stringify({ ...redact(result.next), update: resultSummary(result), reload }, null, 2));
             return;
         }
+        case "account-update-activation": {
+            const result = await accountUpdateActivation({
+                comm: args.comm,
+                botId: args.botId ?? args["bot-id"],
+                accountLabel: args.accountLabel ?? args["account-label"],
+                agent: args.agent,
+                project: args.project,
+                activation: args.activation,
+            });
+            const becameEager = result.previous.activation !== "eager" && result.next.activation === "eager";
+            const reload = await reloadDaemonRegistrations(becameEager ? { ensureRegistrationIds: [result.next.registration_id] } : {});
+            console.log(JSON.stringify({
+                ...redact(result.next),
+                update: activationSummary(result),
+                reload,
+            }, null, 2));
+            return;
+        }
         case "allowlist": {
             await handleAllowlist(rest);
             return;
@@ -109,6 +172,27 @@ async function main() {
         case "migrate": {
             const result = runMigration(parseMigrateArgs(rest));
             console.log(JSON.stringify(result, null, 2));
+            return;
+        }
+        case "wake-mode": {
+            await handleWakeModeCommand(rest);
+            return;
+        }
+        case "herdr-pane-sync": {
+            const out = await herdrPaneSync({
+                project: required(args.project, "--project"),
+                agent: required(args.agent, "--agent"),
+                identityJson: required(args.identityJson ?? args["identity-json"], "--identity-json"),
+                wakeStrict: args.wakeStrict ?? args["wake-strict"],
+            });
+            console.log(JSON.stringify(out, null, 2));
+            return;
+        }
+        case "herdr-pane-release": {
+            const out = await herdrPaneRelease({
+                identityJson: required(args.identityJson ?? args["identity-json"], "--identity-json"),
+            });
+            console.log(JSON.stringify(out, null, 2));
             return;
         }
         case "status": {
@@ -230,6 +314,7 @@ Account commands:
   agents-comm-bus account-remove [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>])
   agents-comm-bus account-relabel [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) --new-account-label <label>
   agents-comm-bus account-update-token [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) (--bot-token <token> | --credentials-file <path.json> | --credentials-json <json>) [--account-id <id>] [--allow-bot-change]
+  agents-comm-bus account-update-activation [--comm telegram] (--bot-id <id> | --account-label <label> [--agent <agent>] [--project <path>]) --activation eager|lazy
 
 Allowlist commands:
   agents-comm-bus allowlist add    --comm <c> --user <id> [--note "..."]                                                      # global
@@ -261,6 +346,14 @@ function relabelSummary(result) {
     return {
         previous_account_label: result.previous.account_label,
         account_label: result.next.account_label,
+        bot_user_id: result.next.bot_user_id,
+    };
+}
+function activationSummary(result) {
+    return {
+        previous_activation: result.previous.activation,
+        activation: result.next.activation,
+        registration_id: result.next.registration_id,
         bot_user_id: result.next.bot_user_id,
     };
 }
